@@ -13,9 +13,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-# 0. 引入 jev-starter 的 venv site-packages，保证运行独立性
-_ADAPTER_SITE_PACKAGES = r"C:\Users\mnb77\jev-starter\.venv\Lib\site-packages"
-if _ADAPTER_SITE_PACKAGES not in sys.path:
+# 0. 引入 jev-starter 的 venv site-packages，保证运行独立性（兼容本机部署与跨机器克隆安装）
+_ADAPTER_SITE_PACKAGES = os.path.join(
+    os.path.expanduser("~"), "jev-starter", ".venv", "Lib", "site-packages"
+)
+if os.path.isdir(_ADAPTER_SITE_PACKAGES) and _ADAPTER_SITE_PACKAGES not in sys.path:
     sys.path.append(_ADAPTER_SITE_PACKAGES)
 
 _adapter_available = True
