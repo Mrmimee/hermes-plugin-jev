@@ -2,10 +2,13 @@
 
 在 Hermes 注册 `jev` 工具集，允许模型在毫秒级做出"单选 (Choice)"、"打分 (Score)"、"是非率 (Noul)"决策。
 底层基于 `system_one_adapter` 接入用户的 Agnes 3.0 Flash。
-零常驻内存，不占本机显存，仅在调用时发起一次 HTTP 请求。
+配备高性能决策缓存：同状态重复判定 0ms 秒级命中，避免重复网络往返。
+零常驻显存，极低内存消耗（LRU 128 条上限）。
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +20,7 @@ from typing import Any, Dict
 _ADAPTER_SITE_PACKAGES = os.path.join(
     os.path.expanduser("~"), "jev-starter", ".venv", "Lib", "site-packages"
 )
+
 if os.path.isdir(_ADAPTER_SITE_PACKAGES) and _ADAPTER_SITE_PACKAGES not in sys.path:
     sys.path.append(_ADAPTER_SITE_PACKAGES)
 
@@ -30,13 +34,48 @@ except Exception:
 _BASE_URL = "https://apihub.agnes-ai.com/v1"
 _MODEL_NAME = "agnes-3.0-flash"
 
+# LRU 决策缓存（上限 128 条，默认 300 秒有效期）
+_CACHE_MAX_SIZE = 128
+_CACHE_TTL_SECONDS = 300
+_DECISION_CACHE: collections.OrderedDict[str, tuple[float, dict]] = collections.OrderedDict()
+
+
+def _get_cache_key(args: Dict[str, Any]) -> str:
+    """计算状态与问题的确定性 SHA256 指纹"""
+    try:
+        raw = json.dumps(args, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        raw = str(args)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_get(key: str) -> dict | None:
+    """获取缓存并执行 LRU 提升与 TTL 过期检查"""
+    if key not in _DECISION_CACHE:
+        return None
+    created_at, result = _DECISION_CACHE[key]
+    if time.time() - created_at > _CACHE_TTL_SECONDS:
+        del _DECISION_CACHE[key]
+        return None
+    _DECISION_CACHE.move_to_end(key)
+    res_copy = dict(result)
+    res_copy["cache_hit"] = True
+    res_copy["latency_seconds"] = 0.0
+    return res_copy
+
+
+def _cache_put(key: str, result: dict) -> None:
+    """写入缓存，超出容量时淘汰最老条目"""
+    if len(_DECISION_CACHE) >= _CACHE_MAX_SIZE:
+        _DECISION_CACHE.popitem(last=False)
+    _DECISION_CACHE[key] = (time.time(), result)
+
 
 def _get_agnes_key() -> str:
     """提取用户的 AGNES_API_KEY"""
     key = os.environ.get("AGNES_API_KEY")
     if key:
         return key
-    # 备用抓取路径：桌面 apikey.txt
     key_file = Path.home() / "OneDrive" / "桌面" / "apikey.txt"
     if key_file.exists():
         lines = key_file.read_text(encoding="utf-8").splitlines()
@@ -60,7 +99,7 @@ JEV_SCHEMA = {
         "Jev 决策小脑（Agnes 3.0 Flash 极速结构化裁决）："
         "把当前的 Agent 状态丢进去，一次性并行判定多个问题——"
         "Choice 决定路由、Score 评估打分、Noul 判断是非风险。"
-        "耗时约 1 秒，不吃本地硬件。"
+        "耗时约 1 秒（缓存命中 0ms），不吃本地硬件。"
     ),
     "parameters": {
         "type": "object",
@@ -77,17 +116,17 @@ JEV_SCHEMA = {
                     "instructions": {"type": "string", "description": "单选意图描述"},
                     "criteria": {
                         "type": "object",
-                        "description": "选项及其含义，格式为 {'选项key': '该选项的描述'}"
-                    }
-                }
+                        "description": "选项及其含义，格式为 {'选项key': '该选项的描述'}",
+                    },
+                },
             },
             "noul": {
                 "type": "object",
                 "description": "需要做的是非题（布尔概率率 0.0~1.0）。",
                 "properties": {
                     "name": {"type": "string", "description": "本题名称"},
-                    "instructions": {"type": "string", "description": "判断意图描述"}
-                }
+                    "instructions": {"type": "string", "description": "判断意图描述"},
+                },
             },
             "score": {
                 "type": "object",
@@ -98,9 +137,13 @@ JEV_SCHEMA = {
                     "criteria": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "评分梯度数组，如 ['低', '中', '高']"
-                    }
-                }
+                        "description": "评分梯度数组，如 ['低', '中', '高']",
+                    },
+                },
+            },
+            "no_cache": {
+                "type": "boolean",
+                "description": "是否跳过本地缓存强制实时推理（默认 false）。",
             },
         },
     },
@@ -124,9 +167,17 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
     if state is None:
         return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
 
+    # 优先查本地高速缓存
+    use_cache = not args.get("no_cache", False)
+    cache_key = _get_cache_key(args)
+    if use_cache:
+        hit = _cache_get(cache_key)
+        if hit is not None:
+            return json.dumps(hit, ensure_ascii=False, indent=2)
+
     client = SystemOneAdapterClient(
         structured_outputs=False,
-        llm_answer_mode="discrete"
+        llm_answer_mode="discrete",
     )
     provider = _build_provider()
 
@@ -136,7 +187,7 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
     if choice_cfg and choice_cfg.get("criteria"):
         questions[choice_cfg.get("name", "choice_q")] = Choice(
             instructions=choice_cfg.get("instructions", "下一步做什么？"),
-            criteria=choice_cfg["criteria"]
+            criteria=choice_cfg["criteria"],
         )
 
     noul_cfg = args.get("noul")
@@ -149,14 +200,17 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
     if score_cfg and score_cfg.get("criteria"):
         questions[score_cfg.get("name", "score_q")] = Score(
             instructions=score_cfg.get("instructions", "评估打分"),
-            criteria=score_cfg["criteria"]
+            criteria=score_cfg["criteria"],
         )
 
     if not questions:
-        return json.dumps({
-            "error": "没有提供任何判定题目，请至少提供 choice、noul 或 score 之一。",
-            "tip": "使用 criteria 字典列出选项或评分梯度。",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "error": "没有提供任何判定题目，请至少提供 choice、noul 或 score 之一。",
+                "tip": "使用 criteria 字典列出选项或评分梯度。",
+            },
+            ensure_ascii=False,
+        )
 
     try:
         t0 = time.time()
@@ -167,7 +221,7 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
         )
         elapsed = round(time.time() - t0, 2)
 
-        result = {"latency_seconds": elapsed}
+        result = {"latency_seconds": elapsed, "cache_hit": False}
 
         if choice_cfg and choice_cfg.get("name", "choice_q") in response.choices:
             q_name = choice_cfg.get("name", "choice_q")
@@ -180,6 +234,9 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
         if score_cfg and score_cfg.get("name", "score_q") in response.scores:
             q_name = score_cfg.get("name", "score_q")
             result["score_answer"] = response.scores[q_name].score
+
+        if use_cache:
+            _cache_put(cache_key, result)
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
