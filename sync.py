@@ -30,12 +30,11 @@ def main():
     if run(["git", "add", "."], cwd=root) != 0:
         sys.exit("❌ git add 失败")
 
-    # 2. 提交（无改动时 git commit 会报 "nothing to commit"，不算错误）
+    # 2. 提交（无改动时 git commit 报 nothing to commit，属正常，继续推送已有提交）
     commit_code = run(["git", "commit", "-m", commit_msg], cwd=root)
-    if commit_code != 0 and "nothing to commit" in str(subprocess.run(
-        ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True
-    ).stdout or ""):
-        print("ℹ️  无新改动，跳过提交")
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True)
+    if commit_code != 0 and not status.stdout.strip():
+        print("ℹ️  无新改动（可能已提交），直接推送已有提交")
     elif commit_code != 0:
         sys.exit(f"❌ git commit 失败（exit {commit_code}）")
 
