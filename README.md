@@ -27,7 +27,7 @@
 | **多题并发打满** | `nouls` / `choices` / `scores` 数组，一次网络往返裁决 N 题，延迟不随题目数增长 |
 | **双层持久化缓存** | 内存 LRU（256 条/1h TTL）+ 磁盘 JSON（`~/.hermes/cache/jev_cache.json`），重启/新子任务秒级 0ms 命中 |
 | **硬超时熔断** | `timeout_seconds` 默认 8s，超时触发 `concurrent.futures.TimeoutError` → 自动降级 advisory，主流程永不挂起 |
-| **审计黑匣子** | 每次判定追加 `~/.hermes/cache/jev_journal.jsonl`（工具、延迟、命中、答案、状态预览），复盘/追踪零成本 |
+| **审计黑匣子** | 每次判定追加 `~/.hermes/cache/jev_journal.jsonl`（工具、延迟、命中、答案、状态预览，超 10MB 自动轮转），复盘/追踪零成本 |
 
 ---
 
@@ -74,7 +74,10 @@
 }
 ```
 
-- 有 `AGNES_API_KEY`：在线走 Jev 概率裁决，`probability >= threshold` 判 `allow`，否则 `ask`
+- 有 `AGNES_API_KEY`：在线走 Jev 概率裁决，分为三档：
+  - `probability >= threshold`：判 **`allow`**（安全放行）
+  - `deny_threshold <= probability < threshold`：判 **`ask`**（存在风险，建议人工确认）
+  - `probability < deny_threshold`（默认 `min(0.25, threshold*0.5)`）：判 **`deny`**（高危操作拦截）
 - 无 key / adapter 缺失 / 超时熔断 / 在线调用失败：自动降级本地破坏性关键词规则（`rm -rf`、`format`、`drop database` 等 → `deny`；`delete`/`删除`/`overwrite` 等 → `ask`；其余 → `allow`），结果带 `advisory=true` 标记，调用方须把 advisory 放行当建议而非许可
 
 ---

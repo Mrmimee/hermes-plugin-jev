@@ -67,7 +67,7 @@ _CACHE_LOCK = threading.RLock()  # 保护 _DECISION_CACHE 的并发读写
 _DISK_LOCK = threading.Lock()     # 保护磁盘写（避免并发 write_text 竞态）
 
 # 模块级单例线程池：超时后不 join 阻塞，后台 worker 自行结束
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jev")
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="jev")
 
 
 def _load_disk_cache() -> None:
@@ -87,14 +87,17 @@ def _load_disk_cache() -> None:
 
 
 def _save_disk_cache() -> None:
-    """轻量写盘，持久化缓存（锁保护，避免并发写竞态）"""
+    """轻量原子写盘，持久化缓存（锁保护 + 临时文件原子替换，防异常断电坏文件）"""
     try:
         with _DISK_LOCK:
             payload = {}
             with _CACHE_LOCK:
                 for k, (created_at, res) in _DECISION_CACHE.items():
                     payload[k] = {"created_at": created_at, "result": res}
-            _CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            # 原子写入：写 tmp 文件后原子替换，避免破坏原文件
+            tmp_file = _CACHE_FILE.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_file.replace(_CACHE_FILE)
     except Exception:
         pass
 
@@ -104,9 +107,12 @@ _load_disk_cache()
 
 
 def _get_cache_key(args: Dict[str, Any]) -> str:
-    """计算状态与问题的确定性 SHA256 指纹"""
+    """计算状态与问题的确定性 SHA256 指纹（剥离 timeout/no_cache 等控制参数，防缓存击穿）"""
     try:
-        raw = json.dumps(args, sort_keys=True, ensure_ascii=True)
+        # 仅保留具有决策语义的字段
+        semantic_keys = {"state", "choice", "choices", "noul", "nouls", "score", "scores", "guard"}
+        semantic_payload = {k: v for k, v in args.items() if k in semantic_keys}
+        raw = json.dumps(semantic_payload, sort_keys=True, ensure_ascii=True)
     except Exception:
         raw = str(args)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -138,8 +144,17 @@ def _cache_put(key: str, result: dict) -> None:
 
 
 def _log_journal(entry: Dict[str, Any]) -> None:
-    """记录判定黑匣子流水（审计日志），故障追踪与吞吐量复盘"""
+    """记录判定黑匣子流水（审计日志，带 10MB 自动轮转备份）"""
     try:
+        if _JOURNAL_FILE.exists() and _JOURNAL_FILE.stat().st_size > 10 * 1024 * 1024:
+            bak = _JOURNAL_FILE.with_suffix(".jsonl.old")
+            try:
+                if bak.exists():
+                    bak.unlink()
+                _JOURNAL_FILE.replace(bak)
+            except Exception:
+                pass
+
         record = dict(entry)
         record["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(_JOURNAL_FILE, "a", encoding="utf-8") as f:
@@ -189,12 +204,18 @@ def _get_agnes_key() -> str:
     key = os.environ.get("AGNES_API_KEY")
     if key:
         return key
-    key_file = Path.home() / "OneDrive" / "桌面" / "apikey.txt"
-    if key_file.exists():
-        lines = key_file.read_text(encoding="utf-8").splitlines()
-        for i, line in enumerate(lines):
-            if "AgnesAi" in line and i + 1 < len(lines):
-                return lines[i + 1].strip()
+    # 兼容 OneDrive 重定向与原生英文/中文桌面路径
+    candidate_paths = [
+        Path.home() / "OneDrive" / "桌面" / "apikey.txt",
+        Path.home() / "Desktop" / "apikey.txt",
+        Path.home() / "桌面" / "apikey.txt",
+    ]
+    for key_file in candidate_paths:
+        if key_file.exists():
+            lines = key_file.read_text(encoding="utf-8").splitlines()
+            for i, line in enumerate(lines):
+                if "AgnesAi" in line and i + 1 < len(lines):
+                    return lines[i + 1].strip()
     return ""
 
 
@@ -606,7 +627,8 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
         threshold = max(0.0, min(float(raw_threshold), 1.0))  # clamp 到 [0, 1]
     except (ValueError, TypeError):
         threshold = 0.75
-    _DENY_THRESHOLD = 0.25  # 概率低于此值判 deny
+    # 动态收敛拒绝阈值，防止用户传入低 threshold 时导致档位倒挂或 ask 被吃掉
+    _DENY_THRESHOLD = min(0.25, threshold * 0.5) if threshold > 0 else 0.0
 
     try:
         t0 = time.time()

@@ -255,6 +255,38 @@ def test_offline_result_cached():
     print("Offline advisory caching (by design): PASSED")
 
 
+
+
+def test_semantic_cache_key_isolation():
+    """语义缓存键防污染测试：改变 timeout_seconds 不影响 cache key"""
+    args1 = {"state": "同语义状态", "noul": {"name": "q", "instructions": "测试"}, "timeout_seconds": 5.0}
+    args2 = {"state": "同语义状态", "noul": {"name": "q", "instructions": "测试"}, "timeout_seconds": 15.0}
+    args3 = {"state": "同语义状态", "noul": {"name": "q", "instructions": "测试"}, "extra_ctrl": "dummy"}
+    key1 = jmod._get_cache_key(args1)
+    key2 = jmod._get_cache_key(args2)
+    key3 = jmod._get_cache_key(args3)
+    assert key1 == key2 == key3, f"Cache keys should match: {key1} vs {key2}"
+    print("Semantic cache key isolation: PASSED")
+
+
+def test_guard_low_threshold_dynamic_deny():
+    """在线 guard 激进超低阈值动态收缩测试：threshold=0.2 时 deny_threshold 动态变为 0.1"""
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+
+    # prob=0.15: 介于 0.1 与 0.2 之间，必须判定为 ask，而绝不能被吃掉或误判为 deny/allow
+    orig = patch_online(make_fake_response(nouls={"guard_q": 0.15}))
+    r = json.loads(jmod._handle_jev_guard({
+        "state": "低阈值边界判定",
+        "guard": {"threshold": 0.2},
+        "no_cache": True,
+    }))
+    restore_online(orig)
+    assert r["threshold"] == 0.2, r
+    assert r["deny_threshold"] == 0.1, r
+    assert r["verdict"] == "ask", r
+    print("Guard low threshold dynamic deny: PASSED")
+
 if __name__ == "__main__":
     test_availability()
     test_guard_offline_rules()
@@ -267,4 +299,6 @@ if __name__ == "__main__":
     test_disk_persistent_cache()
     test_journal_log()
     test_offline_result_cached()
+    test_semantic_cache_key_isolation()
+    test_guard_low_threshold_dynamic_deny()
     print("ALL TESTS PASSED")
