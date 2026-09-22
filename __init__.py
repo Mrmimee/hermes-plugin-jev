@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -62,6 +63,11 @@ _JOURNAL_FILE = _get_cache_dir() / "jev_journal.jsonl"
 _CACHE_MAX_SIZE = 256
 _CACHE_TTL_SECONDS = 3600
 _DECISION_CACHE: collections.OrderedDict[str, tuple[float, dict]] = collections.OrderedDict()
+_CACHE_LOCK = threading.RLock()  # 保护 _DECISION_CACHE 的并发读写
+_DISK_LOCK = threading.Lock()     # 保护磁盘写（避免并发 write_text 竞态）
+
+# 模块级单例线程池：超时后不 join 阻塞，后台 worker 自行结束
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jev")
 
 
 def _load_disk_cache() -> None:
@@ -81,12 +87,14 @@ def _load_disk_cache() -> None:
 
 
 def _save_disk_cache() -> None:
-    """轻量写盘，持久化缓存"""
+    """轻量写盘，持久化缓存（锁保护，避免并发写竞态）"""
     try:
-        payload = {}
-        for k, (created_at, res) in _DECISION_CACHE.items():
-            payload[k] = {"created_at": created_at, "result": res}
-        _CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        with _DISK_LOCK:
+            payload = {}
+            with _CACHE_LOCK:
+                for k, (created_at, res) in _DECISION_CACHE.items():
+                    payload[k] = {"created_at": created_at, "result": res}
+            _CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -105,25 +113,27 @@ def _get_cache_key(args: Dict[str, Any]) -> str:
 
 
 def _cache_get(key: str) -> dict | None:
-    """获取缓存并执行 LRU 提升与 TTL 过期检查"""
-    if key not in _DECISION_CACHE:
-        return None
-    created_at, result = _DECISION_CACHE[key]
-    if time.time() - created_at > _CACHE_TTL_SECONDS:
-        del _DECISION_CACHE[key]
-        return None
-    _DECISION_CACHE.move_to_end(key)
-    res_copy = dict(result)
+    """获取缓存并执行 LRU 提升与 TTL 过期检查（锁保护）"""
+    with _CACHE_LOCK:
+        if key not in _DECISION_CACHE:
+            return None
+        created_at, result = _DECISION_CACHE[key]
+        if time.time() - created_at > _CACHE_TTL_SECONDS:
+            del _DECISION_CACHE[key]
+            return None
+        _DECISION_CACHE.move_to_end(key)
+        res_copy = dict(result)
     res_copy["cache_hit"] = True
     res_copy["latency_seconds"] = 0.0
     return res_copy
 
 
 def _cache_put(key: str, result: dict) -> None:
-    """写入缓存，超出容量时淘汰最老条目并异步持久化"""
-    if len(_DECISION_CACHE) >= _CACHE_MAX_SIZE:
-        _DECISION_CACHE.popitem(last=False)
-    _DECISION_CACHE[key] = (time.time(), result)
+    """写入缓存，超出容量时淘汰最老条目并持久化（锁保护）"""
+    with _CACHE_LOCK:
+        if len(_DECISION_CACHE) >= _CACHE_MAX_SIZE:
+            _DECISION_CACHE.popitem(last=False)
+        _DECISION_CACHE[key] = (time.time(), result)
     _save_disk_cache()
 
 
@@ -357,15 +367,19 @@ def _execute_system_one_with_timeout(
     provider: Any,
     timeout: float,
 ) -> Any:
-    """带硬超时保护的 System One 执行包装器"""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        fut = executor.submit(
-            client.system_one,
-            state=state,
-            questions=questions,
-            model=provider,
-        )
-        return fut.result(timeout=timeout)
+    """带硬超时保护的 System One 执行包装器。
+
+    使用模块级单例线程池：超时时 fut.result(timeout) 抛出 TimeoutError，
+    主调用方立即返回（真硬超时），后台 worker 继续执行至自然结束，
+    绝不阻塞主流程。
+    """
+    fut = _executor.submit(
+        client.system_one,
+        state=state,
+        questions=questions,
+        model=provider,
+    )
+    return fut.result(timeout=timeout)
 
 
 def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
@@ -374,7 +388,11 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
     if state is None:
         return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
 
-    timeout = float(args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS)
+    raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout = max(0.1, min(float(raw_timeout), 120.0))  # clamp 到 [0.1, 120] 秒
+    except (ValueError, TypeError):
+        timeout = _DEFAULT_TIMEOUT_SECONDS
 
     # 优先查本地高速缓存（跨会话磁盘持久化）
     use_cache = not args.get("no_cache", False)
@@ -554,7 +572,11 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
             ensure_ascii=False,
         )
 
-    timeout = float(args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS)
+    raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
+    try:
+        timeout = max(0.1, min(float(raw_timeout), 120.0))
+    except (ValueError, TypeError):
+        timeout = _DEFAULT_TIMEOUT_SECONDS
 
     use_cache = not args.get("no_cache", False)
     cache_key = _get_cache_key(args)
@@ -579,7 +601,12 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
             "这个动作是否可以安全执行？true 表示安全可放行。",
         )
     )
-    threshold = float(guard_cfg.get("threshold", 0.75))
+    raw_threshold = guard_cfg.get("threshold", 0.75)
+    try:
+        threshold = max(0.0, min(float(raw_threshold), 1.0))  # clamp 到 [0, 1]
+    except (ValueError, TypeError):
+        threshold = 0.75
+    _DENY_THRESHOLD = 0.25  # 概率低于此值判 deny
 
     try:
         t0 = time.time()
@@ -596,11 +623,17 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
         )
         elapsed = round(time.time() - t0, 2)
         prob = response.nouls["guard_q"].noul
-        verdict = "allow" if prob >= threshold else "ask"
+        if prob >= threshold:
+            verdict = "allow"
+        elif prob >= _DENY_THRESHOLD:
+            verdict = "ask"
+        else:
+            verdict = "deny"
         result = {
             "verdict": verdict,
             "probability": prob,
             "threshold": threshold,
+            "deny_threshold": _DENY_THRESHOLD,
             "advisory": False,
             "latency_seconds": elapsed,
             "cache_hit": False,
