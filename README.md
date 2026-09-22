@@ -14,8 +14,20 @@
 
 **Jev 并非生成式聊天模型，而是“决策小脑”（System One Model）：**
 * **零废话**：不进行流式长文本输出，输入当前状态，直接输出确定性的结构化判定。
-* **极速响应**：基于 `system_one_adapter` 接入云端 Agnes 3.0 Flash，1 秒内完成判定。
+* **极速响应**：基于 `system_one_adapter` 接入云端 Agnes 3.0 Flash，1~2 秒内完成判定（多题并发同价）。
 * **零本地负载**：完全不占用本地 GPU 显存（VRAM: 0MB），纯轻量 HTTP 交互，无后台常驻进程。
+* **绝不卡死**：8 秒硬超时熔断，超时自动降级本地规则，主流程永远不被网络阻塞。
+
+---
+
+## ⚡ 性能与工程特性
+
+| 特性 | 说明 |
+| :--- | :--- |
+| **多题并发打满** | `nouls` / `choices` / `scores` 数组，一次网络往返裁决 N 题，延迟不随题目数增长 |
+| **双层持久化缓存** | 内存 LRU（256 条/1h TTL）+ 磁盘 JSON（`~/.hermes/cache/jev_cache.json`），重启/新子任务秒级 0ms 命中 |
+| **硬超时熔断** | `timeout_seconds` 默认 8s，超时触发 `concurrent.futures.TimeoutError` → 自动降级 advisory，主流程永不挂起 |
+| **审计黑匣子** | 每次判定追加 `~/.hermes/cache/jev_journal.jsonl`（工具、延迟、命中、答案、状态预览），复盘/追踪零成本 |
 
 ---
 
@@ -27,6 +39,26 @@
 | **`Noul`** | 是非题 | 布尔事件判定或发生概率计算（如：是否属于高危破坏性操作、是否需要联网） |
 | **`Score`** | 打分题 | 离散或连续多梯度评估（如：任务复杂度 0~2 分、相关度评分） |
 | **`Guard`** 🛡️ | 动作闸门 | 执行动作前的 allow/ask/deny 二次判定（`jev_guard` 工具），在线走 Jev 概率裁决，无 key 或失败时自动降级本地离线规则（结果标 `advisory=true`，fail closed） |
+
+### 多题并发打满（1 次请求裁决 N 题）
+
+```json
+{
+  "state": "当前任务上下文",
+  "nouls": [
+    {"name": "是否高危", "instructions": "是否属于破坏性操作？"},
+    {"name": "是否可逆", "instructions": "操作是否可撤销？"}
+  ],
+  "choice": {
+    "name": "路由",
+    "instructions": "优先调用哪个专家？",
+    "criteria": {"coder": "写代码", "searcher": "查资料"}
+  }
+}
+```
+
+结果统一在 `answers` 字段：`{"answers": {"是否高危": 0.0, "是否可逆": 1.0, "路由": "coder"}}`
+单题参数（`choice`/`noul`/`score`）同时保留在结果里做向后兼容（`choice_answer`/`noul_answer`/`score_answer`）。
 
 ### `jev_guard` 动作闸门
 
@@ -43,7 +75,7 @@
 ```
 
 - 有 `AGNES_API_KEY`：在线走 Jev 概率裁决，`probability >= threshold` 判 `allow`，否则 `ask`
-- 无 key / adapter 缺失 / 在线调用失败：自动降级本地破坏性关键词规则（`rm -rf`、`format`、`drop database` 等 → `deny`；`delete`/`删除`/`overwrite` 等 → `ask`；其余 → `allow`），结果带 `advisory=true` 标记，调用方须把 advisory 放行当建议而非许可
+- 无 key / adapter 缺失 / 超时熔断 / 在线调用失败：自动降级本地破坏性关键词规则（`rm -rf`、`format`、`drop database` 等 → `deny`；`delete`/`删除`/`overwrite` 等 → `ask`；其余 → `allow`），结果带 `advisory=true` 标记，调用方须把 advisory 放行当建议而非许可
 
 ---
 
