@@ -19,13 +19,31 @@
 
 ---
 
-## 🧩 核心裁决三原语
+## 🧩 核心裁决原语
 
 | 原语 | 类别 | 典型应用场景 |
 | :--- | :--- | :--- |
 | **`Choice`** | 单选题 | 从多个候选执行器或工具中做路由跳转（如：Coder vs Searcher vs Reviewer） |
 | **`Noul`** | 是非题 | 布尔事件判定或发生概率计算（如：是否属于高危破坏性操作、是否需要联网） |
 | **`Score`** | 打分题 | 离散或连续多梯度评估（如：任务复杂度 0~2 分、相关度评分） |
+| **`Guard`** 🛡️ | 动作闸门 | 执行动作前的 allow/ask/deny 二次判定（`jev_guard` 工具），在线走 Jev 概率裁决，无 key 或失败时自动降级本地离线规则（结果标 `advisory=true`，fail closed） |
+
+### `jev_guard` 动作闸门
+
+对标开源生态的 guard 类设计（allow/ask/deny 三档 + 置信度阈值 + 离线降级）：
+
+```json
+{
+  "state": "执行 rm -rf /data/old_cache",
+  "guard": {
+    "instructions": "该动作是否可安全执行？",
+    "threshold": 0.75
+  }
+}
+```
+
+- 有 `AGNES_API_KEY`：在线走 Jev 概率裁决，`probability >= threshold` 判 `allow`，否则 `ask`
+- 无 key / adapter 缺失 / 在线调用失败：自动降级本地破坏性关键词规则（`rm -rf`、`format`、`drop database` 等 → `deny`；`delete`/`删除`/`overwrite` 等 → `ask`；其余 → `allow`），结果带 `advisory=true` 标记，调用方须把 advisory 放行当建议而非许可
 
 ---
 
@@ -75,7 +93,8 @@ export AGNES_API_KEY="sk-..."
 ```text
 hermes-plugin-jev/
 ├── plugin.yaml       # Hermes 插件声明配置
-├── __init__.py       # 插件入口与 Jev 工具注册实现
+├── __init__.py       # 插件入口与 Jev/jev_guard 工具注册实现
+├── test_verification.py  # 验证测试（可用性 + 离线规则 + 在线路径）
 ├── README.md         # 项目文档
 ├── .gitignore        # Git 忽略配置
 └── sync.py           # 一键更新与 GitHub 同步工具
