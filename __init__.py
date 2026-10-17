@@ -1,7 +1,7 @@
 """Jev/TypeSafe AI 决策小脑 Hermes 插件。
 
 在 Hermes 注册 `jev` 工具集，允许模型在毫秒级做出"单选 (Choice)"、"打分 (Score)"、"是非率 (Noul)"决策。
-支持单题/多题并发打满（1 次请求裁决多个问题），具备双层持久化磁盘缓存、8 秒硬超时熔断与黑匣子审计日志。
+支持单题/多题并发打满（1 次网络往返裁决多个问题），具备双层持久化磁盘缓存、8 秒硬超时熔断与黑匣子审计日志。
 底层基于 `system_one_adapter` 接入用户的 Agnes 3.0 Flash。
 零常驻显存，零后台进程，极低内存消耗。
 """
@@ -230,18 +230,18 @@ def _jev_tool_available() -> bool:
 JEV_SCHEMA = {
     "name": "jev",
     "description": (
-        "Jev 决策小脑（Agnes 3.0 Flash 极速结构化裁决）："
-        "把当前的 Agent 状态丢进去，一次性并行判定多个问题——"
-        "Choice 决定路由、Score 评估打分、Noul 判断是非风险。"
-        "支持单题与多题并发打满（nouls/choices/scores 数组），"
-        "内置双层持久化缓存、8秒超时熔断及审计流水。耗时约 1~2 秒（缓存命中 0ms），不占本地显存。"
+        "Jev 决策小脑（Agnes 3.0 Flash 结构化裁决）：用于在多个可用工具/执行路径之间确有选择不确定性时，"
+        "先把候选项及其用途传入 Choice 进行按需路由；主 Agent 再负责调用所选工具并处理结果。"
+        "普通对话、工具选择显而易见时不要调用 Jev；不要每轮调用，也不要对每次工具调用重复裁决。"
+        "Jev 只输出结构化判断，不会替你调用工具。风险评估可用 Noul，质量/复杂度可用 Score；"
+        "支持多题并发（nouls/choices/scores），带缓存、8秒默认超时熔断和审计记录。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "state": {
                 "type": ["object", "string"],
-                "description": "系统当前的状态数据，可以是一个 JSON 字典或一段描述文本。",
+                "description": "完整当前状态；只传与本次路由/判断相关的信息，避免放入密钥、凭据或无关个人内容。",
             },
             "choice": {
                 "type": "object",
@@ -331,16 +331,16 @@ JEV_SCHEMA = {
 JEV_GUARD_SCHEMA = {
     "name": "jev_guard",
     "description": (
-        "Jev 动作闸门（guard）：执行动作前做 allow/ask/deny 二次判定，"
-        "拦截高危破坏性操作。在线走 Jev 概率裁决，"
-        "无 key、超时熔断或网络失败时自动降级为本地离线规则（结果标 advisory=true，fail closed）。"
+        "Jev 动作闸门（guard）：仅在动作本身具有实质风险、需要额外风险评估时按需调用；"
+        "这是第二意见，不会替代系统或用户授权规则。普通低风险工具调用无需逐次运行 guard。"
+        "在线裁决失败时回退本地规则并标记 advisory；advisory=allow 只是提示，不能作为放行凭据。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "state": {
                 "type": ["object", "string"],
-                "description": "待执行动作的完整描述或上下文（命令、操作、目标对象）。",
+                "description": "只提供与待评估动作直接相关的上下文；移除密钥、令牌、密码和无关个人信息。advisory 结果仅为参考。",
             },
             "guard": {
                 "type": "object",

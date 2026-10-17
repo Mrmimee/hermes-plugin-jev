@@ -48,7 +48,14 @@ def test_availability():
     assert jmod._jev_tool_available() is True
     jmod._get_agnes_key = lambda: ""
     assert jmod._jev_tool_available() is False
-    print("Availability check: PASSED")
+    assert "不要每轮调用" in jmod.JEV_SCHEMA["description"]
+    assert "不会替你调用工具" in jmod.JEV_SCHEMA["description"]
+    assert "无关个人内容" in jmod.JEV_SCHEMA["parameters"]["properties"]["state"]["description"]
+    guard_description = jmod.JEV_GUARD_SCHEMA["description"]
+    assert "普通低风险工具调用无需逐次运行 guard" in guard_description
+    assert "不能作为放行凭据" in guard_description
+    assert "移除密钥、令牌、密码" in jmod.JEV_GUARD_SCHEMA["parameters"]["properties"]["state"]["description"]
+    print("Availability and on-demand routing guidance: PASSED")
 
 
 def test_guard_offline_rules():
@@ -107,7 +114,7 @@ def test_guard_online_timeout_fallback():
 
 
 def test_guard_threshold_clamp():
-    """threshold 越界 clamp：5.0→1.0，-1→0.0，"abc"→默认 0.75。"""
+    """threshold 越界 clamp：5.0→1.0，-1→0.0，\"abc\"→默认 0.75。"""
     jmod._adapter_available = True
     jmod._get_agnes_key = lambda: "fake"
 
@@ -253,8 +260,6 @@ def test_offline_result_cached():
     assert key in jmod._DECISION_CACHE, "offline advisory should be cached"
     jmod._DECISION_CACHE.pop(key, None)
     print("Offline advisory caching (by design): PASSED")
-
-
 
 
 def test_semantic_cache_key_isolation():

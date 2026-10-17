@@ -38,7 +38,7 @@
 | **`Choice`** | 单选题 | 从多个候选执行器或工具中做路由跳转（如：Coder vs Searcher vs Reviewer） |
 | **`Noul`** | 是非题 | 布尔事件判定或发生概率计算（如：是否属于高危破坏性操作、是否需要联网） |
 | **`Score`** | 打分题 | 离散或连续多梯度评估（如：任务复杂度 0~2 分、相关度评分） |
-| **`Guard`** 🛡️ | 动作闸门 | 执行动作前的 allow/ask/deny 二次判定（`jev_guard` 工具），在线走 Jev 概率裁决，无 key 或失败时自动降级本地离线规则（结果标 `advisory=true`，fail closed） |
+| **`Guard`** 🛡️ | 动作闸门 | 执行动作前做 allow/ask/deny 三档风险评估；作为第二意见，不替代用户/系统授权。在线失败或离线时结果带 `advisory=true`，包括 `allow` 也不能视作许可。 |
 
 ### 多题并发打满（1 次请求裁决 N 题）
 
@@ -79,6 +79,31 @@
   - `deny_threshold <= probability < threshold`：判 **`ask`**（存在风险，建议人工确认）
   - `probability < deny_threshold`（默认 `min(0.25, threshold*0.5)`）：判 **`deny`**（高危操作拦截）
 - 无 key / adapter 缺失 / 超时熔断 / 在线调用失败：自动降级本地破坏性关键词规则（`rm -rf`、`format`、`drop database` 等 → `deny`；`delete`/`删除`/`overwrite` 等 → `ask`；其余 → `allow`），结果带 `advisory=true` 标记，调用方须把 advisory 放行当建议而非许可
+
+## 使用原则：按需路由
+
+- 普通对话、工具选择显而易见时，不调用 Jev；不要每轮调用，也不要每次工具调用前重复裁决。
+- 只有多个工具或执行路径都合理、选择确有不确定性时，才用 `Choice` 选择路由。把可用候选及用途写清楚，例如 `computer_use`（操作桌面界面）、`browser`（网页交互）、`web_search`（查资料）。
+- Jev 返回结构化建议；主 Agent 根据结果调用工具并负责执行。Jev 本身不会调用或加载其他工具。
+- 只传这次判断所需的上下文，不要发送密钥、令牌、密码或无关个人信息。
+- `jev_guard` 是高风险动作的可选第二意见，不是系统授权机制。普通低风险工具调用无需逐个运行；在线失败时的 `advisory` 结果（包括 `allow`）只能作为提示，不能视为安全许可。
+
+### 工具路由示例
+
+```json
+{
+  "state": "用户要在当前桌面中操作一个网页应用；browser 与 computer_use 都可行。",
+  "choice": {
+    "name": "tool_route",
+    "instructions": "根据任务是否需要真实桌面视觉/鼠标键盘操作选择工具。",
+    "criteria": {
+      "computer_use": "需要观察或操作桌面窗口、原生应用或屏幕上的 UI",
+      "browser": "只需在网页标签中导航、读取或填写网页内容",
+      "web_search": "任务是查找网络资料，不需要操作现有界面"
+    }
+  }
+}
+```
 
 ---
 
