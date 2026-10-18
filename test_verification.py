@@ -292,6 +292,265 @@ def test_guard_low_threshold_dynamic_deny():
     assert r["verdict"] == "ask", r
     print("Guard low threshold dynamic deny: PASSED")
 
+# ---------- TypeSafe 官方直连（2026-10-18 迭代）Mock 基础设施 ----------
+import contextlib
+import os as _os
+
+
+@contextlib.contextmanager
+def typesafe_env(key: "str | None" = "test-typesafe-key", model=None):
+    """临时注入 TYPESAFE_API_KEY / JEV_MODEL，退出时精确还原（避免污染其它用例）。"""
+    touched = ("TYPESAFE_API_KEY", "JEV_API_KEY", "JEV_MODEL")
+    old = {k: _os.environ.get(k) for k in touched}
+    if key is None:
+        _os.environ.pop("TYPESAFE_API_KEY", None)
+        _os.environ.pop("JEV_API_KEY", None)
+    else:
+        _os.environ["TYPESAFE_API_KEY"] = key
+        _os.environ.pop("JEV_API_KEY", None)
+    if model:
+        _os.environ["JEV_MODEL"] = model
+    else:
+        _os.environ.pop("JEV_MODEL", None)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+@contextlib.contextmanager
+def patch_http(fn):
+    """替换底层 HTTP POST（离线跑直连路径，不触网、不烧 token）。"""
+    orig = jmod._http_post_json
+    jmod._http_post_json = fn
+    try:
+        yield
+    finally:
+        jmod._http_post_json = orig
+
+
+def typesafe_payload(answers):
+    return {"model": "jev-1.14.0", "answers": answers, "usage": {"input_tokens": 321, "output_tokens": 12}}
+
+
+def ts_answers(choice=None, nouls=None, scores=None):
+    """按官方响应形状构造 answers"""
+    out = {}
+    if choice:
+        out[choice[0]] = {"type": "choice", "choice": choice[1], "probabilities": {choice[1]: 0.9}, "confidence": 0.9}
+    for k, v in (nouls or {}).items():
+        out[k] = {"type": "noul", "noul": v}
+    for k, v in (scores or {}).items():
+        out[k] = {"type": "score", "score": v, "legend": {}, "confidence": 0.8}
+    return out
+
+
+def test_typesafe_direct_payload_and_parse():
+    """官方直连：payload 结构正确（model/state/questions），响应解析为统一 answers 形状。"""
+    captured = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["headers"] = headers
+        return typesafe_payload(ts_answers(
+            choice=("route", "coder"),
+            nouls={"q1": 1.0, "q2": 0.0, "q3": 0.5},
+            scores={"complexity": 2.0},
+        ))
+
+    with typesafe_env(model="jev-1.14.0"), patch_http(fake_post):
+        r = json.loads(jmod._handle_jev({
+            "state": "多题直连测试",
+            "nouls": [{"name": "q1", "instructions": "是否安全？"}, {"name": "q2", "instructions": "是否可逆？"}],
+            "noul": {"name": "q3", "instructions": "是否需要确认？"},
+            "choice": {"name": "route", "instructions": "优先调用谁？", "criteria": {"coder": "写代码", "searcher": "查资料"}},
+            "score": {"name": "complexity", "instructions": "复杂度？", "criteria": ["低", "中", "高"]},
+            "no_cache": True,
+        }))
+
+    assert captured["url"] == jmod._TYPESAFE_URL, captured["url"]
+    assert captured["payload"]["model"] == "jev-1.14.0", captured["payload"]["model"]
+    assert captured["payload"]["state"] == "多题直连测试"
+    qs = captured["payload"]["questions"]
+    assert qs["route"]["type"] == "choice" and qs["route"]["criteria"] == {"coder": "写代码", "searcher": "查资料"}, qs
+    assert qs["q1"]["type"] == "noul" and "instructions" in qs["q1"], qs
+    assert qs["complexity"]["type"] == "score" and qs["complexity"]["criteria"] == ["低", "中", "高"], qs
+    assert captured["headers"]["Authorization"].startswith("Bearer "), captured["headers"]
+    assert r["engine"] == "typesafe" and r["model"] == "jev-1.14.0", r
+    assert r["answers"]["route"] == "coder" and r["answers"]["q1"] == 1.0 and r["answers"]["complexity"] == 2.0, r
+    assert r["choice_answer"] == "coder" and r["noul_answer"] == 0.5, r
+    assert r["usage"] == {"input_tokens": 321, "output_tokens": 12}, r
+    print("TypeSafe direct: payload shape + answer parsing: PASSED")
+
+
+def test_typesafe_redaction():
+    """凭据脱敏：state 里的 key/token/password 不会原样发给第三方。"""
+    captured = {}
+
+    def fake_post(url, payload, headers, timeout):
+        captured["payload"] = payload
+        return typesafe_payload(ts_answers(nouls={"q": 1.0}))
+
+    secret_state = "curl -H 'Authorization: Bearer sk-abcdef1234567890' && export GITHUB_TOKEN=github_pat_ABCDEFGHIJKLMNOPQRSTUV && password=hunter2secret"
+    with typesafe_env(), patch_http(fake_post):
+        jmod._handle_jev({"state": secret_state, "noul": {"name": "q", "instructions": "安全？"}, "no_cache": True})
+
+    sent = captured["payload"]["state"]
+    assert "sk-abcdef1234567890" not in sent, sent
+    assert "github_pat_ABCDEFGHIJKLMNOPQRSTUV" not in sent, sent
+    assert "hunter2secret" not in sent, sent
+    assert "[REDACTED]" in sent, sent
+    # 结构型 state：按键名脱敏（api_key / token / secret / password …）
+    structured = jmod._redact({"cmd": "run", "api_key": "abcdef1234567890", "nested": {"authorization": "xyz"}})
+    assert "abcdef1234567890" not in json.dumps(structured, ensure_ascii=False), json.dumps(structured, ensure_ascii=False)
+    assert "xyz" not in json.dumps(structured, ensure_ascii=False), json.dumps(structured, ensure_ascii=False)
+    assert "run" in json.dumps(structured, ensure_ascii=False), "非敏感字段必须保留"
+    print("Secret redaction before online judgment: PASSED")
+
+
+def test_typesafe_engine_priority():
+    """引擎选择：有 TypeSafe key 时走直连，不再调用 adapter 的 client.system_one。"""
+    calls = {"adapter": 0}
+
+    class BoomClient:
+        def system_one(self, **kwargs):
+            calls["adapter"] += 1
+            raise AssertionError("不应该走 adapter 分支")
+
+    def fake_post(url, payload, headers, timeout):
+        return typesafe_payload(ts_answers(nouls={"q": 1.0}))
+
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake-agnes"
+    with typesafe_env(), patch_http(fake_post):
+        assert jmod._active_engine().startswith("typesafe:"), jmod._active_engine()
+        fb = jmod._executor.submit(jmod._execute_system_one_with_timeout, BoomClient(), "s", {"q": jmod.Noul(instructions="x")}, None, 5.0)
+        resp = fb.result(timeout=10)
+    assert calls["adapter"] == 0, calls
+    assert resp.nouls["q"].noul == 1.0, resp
+    print("Engine priority (typesafe > agnes): PASSED")
+
+
+def test_typesafe_http_error_fallback():
+    """直连 401 / 网络错误：降级 advisory，不抛异常、不阻塞主流程。"""
+    def fake_post(url, payload, headers, timeout):
+        raise RuntimeError("TypeSafe HTTP 401: {\"detail\":\"invalid token\"}")
+
+    with typesafe_env(), patch_http(fake_post):
+        r = json.loads(jmod._handle_jev({
+            "state": "401 降级测试", "noul": {"name": "q", "instructions": "是否？"}, "no_cache": True,
+        }))
+    assert r["advisory"] is True, r
+    assert "401" in r["reason"], r
+    print("TypeSafe HTTP error -> advisory fallback: PASSED")
+
+
+def test_typesafe_429_retry_once():
+    """429 限流：按官方建议退避重试一次即成功。"""
+    calls = {"n": 0}
+
+    def fake_post(url, payload, headers, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("TypeSafe HTTP 429: rate limited")
+        return typesafe_payload(ts_answers(choice=("route", "searcher")))
+
+    with typesafe_env(), patch_http(fake_post):
+        r = json.loads(jmod._handle_jev({
+            "state": "429 重试测试",
+            "choice": {"name": "route", "instructions": "选一个", "criteria": {"searcher": "查资料", "coder": "写代码"}},
+            "no_cache": True,
+            "timeout_seconds": 20.0,
+        }))
+    assert calls["n"] == 2, calls
+    assert r["answers"]["route"] == "searcher", r
+    print("TypeSafe 429 backoff retry (1x): PASSED")
+
+
+def test_guard_multi_signal_verdict():
+    """guard 六信号确定性裁决：读凭据→deny、自我游说→ask、策略允许+低破坏→allow、破坏大→ask。"""
+    cases = [
+        ({"policy_allows": 0.9, "reads_secrets": 0.8, "sends_outbound": 0.1, "self_advocating": 0.1, "blast_radius": 1.0}, "deny"),
+        ({"policy_allows": 0.9, "reads_secrets": 0.1, "sends_outbound": 0.1, "self_advocating": 0.7, "blast_radius": 0.0}, "ask"),
+        ({"policy_allows": 0.9, "reads_secrets": 0.1, "sends_outbound": 0.1, "self_advocating": 0.1, "blast_radius": 0.0}, "allow"),
+        ({"policy_allows": 0.9, "reads_secrets": 0.1, "sends_outbound": 0.1, "self_advocating": 0.1, "blast_radius": 1.8}, "ask"),
+        ({"policy_allows": 0.2, "reads_secrets": 0.1, "sends_outbound": 0.1, "self_advocating": 0.1, "blast_radius": 0.0}, "ask"),
+    ]
+    for signals, expect in cases:
+        got = jmod._guard_verdict_from_signals(signals, 0.75)
+        assert got is not None and got[0] == expect, (signals, got, expect)
+    # 信号不全 → 返回 None（交回旧三档）
+    assert jmod._guard_verdict_from_signals({"guard_q": 0.9}, 0.75) is None
+
+    # 端到端（mock 在线响应带 6 信号）
+    sig = {"policy_allows": 0.95, "reads_secrets": 0.05, "sends_outbound": 0.05, "self_advocating": 0.05, "blast_radius": 0.0}
+    resp = make_fake_response(
+        nouls={k: v for k, v in sig.items() if k != "blast_radius"} | {"guard_q": 0.9},
+        scores={"blast_radius": sig["blast_radius"]},
+    )
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+    orig = patch_online(resp)
+    r = json.loads(jmod._handle_jev_guard({"state": "多信号 guard", "no_cache": True}))
+    restore_online(orig)
+    assert r["verdict"] == "allow", r
+    assert r["verdict_source"] == "signals", r
+    assert r["signals"]["blast_radius"] == 0.0, r
+    print("Guard multi-signal deterministic verdict: PASSED")
+
+
+def test_engine_isolated_cache_key():
+    """缓存键含引擎标识：换引擎/换模型后不复用旧引擎结论。"""
+    args = {"state": "引擎隔离", "noul": {"name": "q", "instructions": "测试"}}
+    with typesafe_env(key=None):
+        if _os.environ.get("AGNES_API_KEY"):
+            k_online = jmod._get_cache_key(args)
+        else:
+            k_online = jmod._get_cache_key(args)
+    with typesafe_env(model="jev-latest"):
+        k_ts = jmod._get_cache_key(args)
+    with typesafe_env(model="jev-1.14.0"):
+        k_ts2 = jmod._get_cache_key(args)
+    assert k_ts != k_ts2, "不同 Jev 模型必须产生不同缓存键"
+    assert k_ts != k_online, "typesafe 引擎不得与其它引擎共用缓存键"
+    print("Cache key isolation per engine/model: PASSED")
+
+
+def test_jev_usage_serialization():
+    """回归：SDK Usage 对象必须转 dict，否则 json.dumps 崩掉整条结果、在线降 advisory（2026-10-18 实弹发现）。"""
+    class FakeUsage:
+        input_tokens = 268
+        output_tokens = 41
+        def model_dump(self):
+            return {"input_tokens": 268, "output_tokens": 41}
+
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+    resp = make_fake_response(choices={"route": "searcher"}, nouls={"risky": 0.2}, scores={"effort": 1.0})
+    resp.usage = FakeUsage()
+    resp.engine = "agnes"
+    resp.model = "agnes-3.0-flash"
+    args = {
+        "state": "usage 序列化回归",
+        "choice": {"name": "route", "criteria": {"searcher": "查资料", "coder": "写代码"}},
+        "noul": {"name": "risky", "instructions": "有风险?"},
+        "score": {"name": "effort", "criteria": ["low", "mid", "high"]},
+        "no_cache": True,
+    }
+    orig = patch_online(resp)
+    r = json.loads(jmod._handle_jev(args))  # Usage 对象混进来会在这里炸
+    restore_online(orig)
+    assert r.get("advisory") is False, r
+    assert r["answers"]["route"] == "searcher" and r["answers"]["risky"] == 0.2
+    assert r["usage"] == {"input_tokens": 268, "output_tokens": 41}, r.get("usage")
+    print("Jev usage serialization (SDK object -> dict): PASSED")
+
+
 if __name__ == "__main__":
     test_availability()
     test_guard_offline_rules()
@@ -306,4 +565,12 @@ if __name__ == "__main__":
     test_offline_result_cached()
     test_semantic_cache_key_isolation()
     test_guard_low_threshold_dynamic_deny()
+    test_typesafe_direct_payload_and_parse()
+    test_typesafe_redaction()
+    test_typesafe_engine_priority()
+    test_typesafe_http_error_fallback()
+    test_typesafe_429_retry_once()
+    test_guard_multi_signal_verdict()
+    test_engine_isolated_cache_key()
+    test_jev_usage_serialization()
     print("ALL TESTS PASSED")

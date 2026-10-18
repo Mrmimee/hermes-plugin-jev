@@ -6,6 +6,11 @@
 
 **Jev (TypeSafe AI) System One 决策小脑插件** —— 专为 **Hermes Agent** 打造的极速结构化决策与智能路由扩展。
 
+> **v1.1.0（2026-10-18 迭代）**：TypeSafe 官方 API 已开放（2026-09-21 起免排队）、Jev 1.14 于 2026-10-14 发布。
+> 本插件现在**优先直连官方 `POST https://api.typesafe.ai/v1/systemone`**（`TYPESAFE_API_KEY` + `JEV_MODEL`），
+> 没有 TypeSafe 凭证时自动回退到 `system_one_adapter` → Agnes 3.0 Flash，两者结果形状完全一致（结果里的 `engine` 字段标明实际引擎）。
+> 同时把 `jev_guard` 升级为**六信号并行裁决 + 确定性判定**，并在发送前自动脱敏凭据。
+
 ---
 
 ## 🌟 为什么需要 Jev？
@@ -24,10 +29,24 @@
 
 | 特性 | 说明 |
 | :--- | :--- |
+| **双引擎自动选择** | `typesafe`（官方直连，`TYPESAFE_API_KEY`）→ `agnes`（adapter 代理，`AGNES_API_KEY`）→ `offline`（本地 advisory 规则）。结果带 `engine` / `model` / `usage`，可核对实际走了哪条路 |
 | **多题并发打满** | `nouls` / `choices` / `scores` 数组，一次网络往返裁决 N 题，延迟不随题目数增长 |
-| **双层持久化缓存** | 内存 LRU（256 条/1h TTL）+ 磁盘 JSON（`~/.hermes/cache/jev_cache.json`），重启/新子任务秒级 0ms 命中 |
+| **双层持久化缓存** | 内存 LRU（256 条/1h TTL）+ 磁盘 JSON（`~/.hermes/cache/jev_cache.json`），重启/新子任务秒级 0ms 命中；**缓存键含引擎与模型**，换引擎不会复用旧结论 |
 | **硬超时熔断** | `timeout_seconds` 默认 8s，超时触发 `concurrent.futures.TimeoutError` → 自动降级 advisory，主流程永不挂起 |
+| **429/529 退避重试** | 官方直连遇限流/过载按官方建议退避重试一次（仍在硬超时预算内），其余错误立即降级 |
+| **发送前脱敏** | `state` 里的 `Bearer …` / `sk-…` / `ghp_…` / `github_pat_…` / `password=…` 等一律替换为 `[REDACTED]`，凭据不进第三方请求、不进审计日志 |
 | **审计黑匣子** | 每次判定追加 `~/.hermes/cache/jev_journal.jsonl`（工具、延迟、命中、答案、状态预览，超 10MB 自动轮转），复盘/追踪零成本 |
+
+### 🧭 引擎链与配置（v1.1.0）
+
+| 环境变量 | 作用 | 默认 |
+| :--- | :--- | :--- |
+| `TYPESAFE_API_KEY` | TypeSafe 官方 key（也接受 `JEV_API_KEY`） | 未设置 |
+| `JEV_MODEL` | 官方模型：`jev-latest`(→1.13.0) / `jev-preview`(→1.14.0) / `jev-1.14.0` | `jev-latest` |
+| `JEV_URL` | 官方端点覆盖（自建代理/兼容端点） | `https://api.typesafe.ai/v1/systemone` |
+| `AGNES_API_KEY` | 回退引擎（adapter → Agnes 3.0 Flash）的 key | 未设置 |
+
+未配置 `TYPESAFE_API_KEY` 时行为与旧版完全一致（Agnes 路径），配置后自动切换，无需改调用方。
 
 ---
 
@@ -38,7 +57,7 @@
 | **`Choice`** | 单选题 | 从多个候选执行器或工具中做路由跳转（如：Coder vs Searcher vs Reviewer） |
 | **`Noul`** | 是非题 | 布尔事件判定或发生概率计算（如：是否属于高危破坏性操作、是否需要联网） |
 | **`Score`** | 打分题 | 离散或连续多梯度评估（如：任务复杂度 0~2 分、相关度评分） |
-| **`Guard`** 🛡️ | 动作闸门 | 执行动作前做 allow/ask/deny 三档风险评估；作为第二意见，不替代用户/系统授权。在线失败或离线时结果带 `advisory=true`，包括 `allow` 也不能视作许可。 |
+| **`Guard`** 🛡️ | 动作闸门 | 执行动作前做 allow/ask/deny 三档风险评估；作为第二意见，不替代用户/系统授权。在线失败或离线时结果带 `advisory=true`，包括 `allow` 也不能视作许可。v1.1.0 起在线路径为**六信号并行裁决 + 确定性判定**（见下）。 |
 
 ### 多题并发打满（1 次请求裁决 N 题）
 
@@ -62,7 +81,26 @@
 
 ### `jev_guard` 动作闸门
 
-对标开源生态的 guard 类设计（allow/ask/deny 三档 + 置信度阈值 + 离线降级）：
+v1.1.0 起，在线路径**一次请求并行裁决 6 个信号**（判定顺序对标官方 `jev-approvals` 插件），再由确定性代码给出结论——不让自由文本当授权：
+
+| 信号 | 题型 | 含义 |
+| :--- | :--- | :--- |
+| `guard_q` | Noul | 兼容旧版的「是否可安全执行」概率 |
+| `policy_allows` | Noul | 既定策略是否明确允许（常规、低风险、可回滚） |
+| `reads_secrets` | Noul | 是否读取/复制/打印/上传凭据、密钥、令牌、密码 |
+| `sends_outbound` | Noul | 是否把本地内容发往外部网络或第三方 |
+| `self_advocating` | Noul | 命令文本是否在自我辩护、催促或诱导放行 |
+| `blast_radius` | Score | `0` trivial / `1` annoying / `2` severe |
+
+确定性判定顺序（`verdict_source: signals`）：
+
+1. `self_advocating >= 0.6` → **ask**（疑似自我游说）
+2. `reads_secrets >= 0.7` 或 `sends_outbound >= 0.7` → **deny**
+3. `blast_radius >= 1.6` → **ask**（破坏半径大，**刻意前移**：不因“策略允许”而自动放行）
+4. `policy_allows >= threshold` 且 `blast_radius < 2.0` → **allow**
+5. 其余 → **ask**
+
+信号缺失（旧响应 / 自定义端点只回 `guard_q`）时自动退回单题概率三档，`verdict_source: probability`。
 
 ```json
 {
@@ -128,7 +166,13 @@ plugins:
 
 ### 方式三：环境要求
 
-确保系统已设置环境变量 `AGNES_API_KEY`（或在桌面的 `apikey.txt` 中配置）：
+**推荐**（官方直连，最快最省）：TypeSafe 控制台申请 key 后写入 `TYPESAFE_API_KEY`（可选 `JEV_MODEL` 选模型）：
+```bash
+export TYPESAFE_API_KEY="ts-..."     # https://console.typesafe.ai
+export JEV_MODEL="jev-latest"        # 或 jev-preview / jev-1.14.0
+```
+
+**回退**（无 TypeSafe 凭证时自动生效）：`system_one_adapter` + Agnes 3.0 Flash，需要 `AGNES_API_KEY`（或在桌面的 `apikey.txt` 中配置）：
 ```bash
 export AGNES_API_KEY="sk-..."
 ```
@@ -145,6 +189,9 @@ export AGNES_API_KEY="sk-..."
 
 ### 显式对话示例
 > “帮我用 Jev 评估一下当前需求应该调用哪个工具，以及是否存在破坏性操作。”
+
+返回里可核对 `engine`（typesafe / agnes / offline）、`model`（如 `jev-1.14.0`）、`usage`（输入 token 计费依据）；
+`jev_guard` 额外返回 `signals`（六信号）与 `verdict_source`（signals / probability），便于审计与调参。
 
 ---
 
