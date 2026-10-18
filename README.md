@@ -192,11 +192,19 @@ export AGNES_API_KEY="sk-..."
 hermes-plugin-jev/
 ├── plugin.yaml       # Hermes 插件声明配置
 ├── __init__.py       # 插件入口与 Jev/jev_guard 工具注册实现
-├── test_verification.py  # 验证测试（可用性 + 离线规则 + 在线路径）
+├── skills/
+│   └── jev-decision-engine/
+│       └── SKILL.md  # 捆绑技能（随插件分发，启用即以 jev:jev-decision-engine 出现在技能列表）
+├── test_verification.py  # 验证测试（可用性 + 无引擎报错 + 在线路径 + 脱敏/六信号/usage）
 ├── README.md         # 项目文档
 ├── .gitignore        # Git 忽略配置
 └── sync.py           # 一键更新与 GitHub 同步工具
 ```
+
+### 🧠 捆绑技能 `jev-decision-engine`
+
+插件在 `register()` 里调用 `ctx.register_skill(...)` 把 `skills/jev-decision-engine/SKILL.md` 注册为插件技能：
+**克隆/更新仓库就自带这份技能**，不需要单独往 `~/.hermes/skills/` 拷，也不会被技能清理误删。内容包含何时调 `jev` / `jev_guard`、可直接抄的参数模板、结果字段读法、失败语义（error ≠ allow）与依赖桥自检步骤。
 
 ---
 

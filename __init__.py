@@ -825,7 +825,7 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
 
 
 def register(ctx) -> None:
-    """注册 Jev 工具"""
+    """注册 Jev 工具与配套技能"""
     ctx.register_tool(
         name="jev",
         toolset="jev",
@@ -842,3 +842,18 @@ def register(ctx) -> None:
         check_fn=None,  # 始终注册：可用时走在线六信号裁决，不可用时明确返回 error
         emoji="🛡️",
     )
+
+    # 捆绑技能：随插件分发（克隆仓库即有），插件启用即以 jev:jev-decision-engine 出现在技能列表。
+    # 技能文件缺失不应影响工具注册，因此整段兜底。
+    try:
+        skill_md = Path(__file__).resolve().parent / "skills" / "jev-decision-engine" / "SKILL.md"
+        if skill_md.exists():
+            ctx.register_skill(
+                "jev-decision-engine",
+                skill_md,
+                "Use when a choice has real uncertainty (which tool or path to take) "
+                "or a risky action needs a structured second opinion before executing.",
+                {"name": "jev-decision-engine"},
+            )
+    except Exception:
+        pass
