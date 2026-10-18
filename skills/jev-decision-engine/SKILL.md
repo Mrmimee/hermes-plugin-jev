@@ -50,6 +50,20 @@ metadata:
 - `jev_guard`：`verdict`（allow / ask / deny）+ `verdict_source`（signals / probability）+ `signals`（policy_allows、reads_secrets、sends_outbound、self_advocating、blast_radius）+ `probability`。
   `ask` 就停下来问人；`deny` 不要执行；`allow` 也只是第二意见，不是授权。
 
+## 每次调用都要留一行可见摘要
+
+`jev` / `jev_guard` 返回后，**在同一轮回复里写一行**，让用户看得见这次裁决，不要把 JSON 直接甩出来：
+
+```
+🧠 Jev · <题名>=<答案> · <latency_seconds>s[ · 缓存]
+🛡️ Jev Guard · <verdict> (<probability>) · <latency_seconds>s
+```
+
+- 一轮里调了多次就写多行，按调用顺序，别合并成一句笼统的"做了几次判断"。
+- `answers` 里的值原样给出（0/1/2 或概率），不要改写成形容词，除非用户问的是结论本身。
+- 返回 `error` 时写 `🧠 Jev · 失败：<error 摘要>`，并说明这次没有裁决结果。
+- 这一行是摘要，不是解释：不要附带推理过程，也不要复述 `state`。
+
 ## 失败语义（最重要）
 
 - **没有本地兜底**：引擎不可用 / 超时 / 调用失败一律返回 `error`，**不给 verdict**。看到 error 就等于「没裁决过」——按自己的判断继续，并在回复里说明 guard 没跑成；**绝不允许把 error 当成 allow**。

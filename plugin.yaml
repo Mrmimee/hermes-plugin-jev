@@ -1,6 +1,6 @@
 ---
 name: jev
 description: "Jev 决策小脑接入 Hermes：system_one_adapter → Agnes 3.0 Flash 结构化决策（单选/是非/打分 + 六信号动作闸门），引擎不可用时直接报错、不编造结论"
-version: 1.4.1
+version: 1.4.2
 enabled: true
 kind: backend
