@@ -101,7 +101,6 @@ def test_guard_online_three_tiers():
         }))
         restore_online(orig)
         assert r["verdict"] == expect, (prob, r)
-        assert r["advisory"] is False, r
         assert "deny_threshold" in r, r
     print("Guard online three-tier (allow/ask/deny): PASSED")
 
@@ -181,7 +180,6 @@ def test_jev_multi_question_mock():
     assert r["choice_answer"] == "coder", r
     assert r["noul_answer"] == 0.5, r
     assert r["score_answer"] == "高", r
-    assert r["advisory"] is False, r
     print(f"Multi-question batching (mock): PASSED ({len(r['answers'])} answers)")
 
 
@@ -235,6 +233,12 @@ def test_disk_persistent_cache():
     r1 = json.loads(jmod._handle_jev(args))
     restore_online(orig)
     assert r1["cache_hit"] is False, r1
+    # 磁盘写已移到线程池：等它落盘（最多 2s）
+    import time as _time
+    for _ in range(40):
+        if jmod._CACHE_FILE.exists() and jmod._CACHE_FILE.stat().st_size > 0:
+            break
+        _time.sleep(0.05)
     assert jmod._CACHE_FILE.exists() and jmod._CACHE_FILE.stat().st_size > 0
 
     import importlib
@@ -410,10 +414,33 @@ def test_jev_usage_serialization():
     orig = patch_online(resp)
     r = json.loads(jmod._handle_jev(args))  # Usage 对象混进来会在这里炸
     restore_online(orig)
-    assert r.get("advisory") is False, r
     assert r["answers"]["route"] == "searcher" and r["answers"]["risky"] == 0.2
     assert r["usage"] == {"input_tokens": 268, "output_tokens": 41}, r.get("usage")
     print("Jev usage serialization (SDK object -> dict): PASSED")
+
+
+def test_redaction_structured_and_new_patterns():
+    """敏感键下的 dict/list 值、以及 Google/Slack/JWT/PEM 形态密钥都必须被遮蔽。"""
+    structured = jmod._redact({
+        "api_key": {"inner": "abc1234567890"},
+        "token": ["x" * 20],
+        "note": "ok",
+    })
+    blob = json.dumps(structured, ensure_ascii=False)
+    assert "abc1234567890" not in blob and "xxxxxxxx" not in blob, blob
+    assert structured["note"] == "ok", structured
+
+    # 假样本在运行时拼接：避免仓库里出现可被 GitHub secret scanning 命中的字面量
+    fakes = (
+        "AIza" + "SyA" + "1" * 30,                                            # Google API key 形态
+        "xox" + "b-" + "1" * 12 + "-" + "a" * 12,                             # Slack token 形态
+        "eyJ" + "hbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "a" * 16,  # JWT 形态
+        "-----BEGIN " + "RSA PRIVATE KEY" + "-----",                          # PEM 私钥形态
+    )
+    for secret in fakes:
+        out = jmod._redact(f"prefix {secret} suffix")
+        assert "REDACTED" in out and secret not in out, (secret, out)
+    print("Redaction: structured keys + Google/Slack/JWT/PEM: PASSED")
 
 
 if __name__ == "__main__":
@@ -433,4 +460,5 @@ if __name__ == "__main__":
     test_redaction_before_online_judgment()
     test_guard_multi_signal_verdict()
     test_jev_usage_serialization()
+    test_redaction_structured_and_new_patterns()
     print("ALL TESTS PASSED")

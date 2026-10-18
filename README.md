@@ -206,7 +206,7 @@ hermes-plugin-jev/
 插件在 `register()` 里调用 `ctx.register_skill(...)` 把 `skills/jev-decision-engine/SKILL.md` 注册为插件技能：
 **克隆/更新仓库就自带这份技能**，不需要单独往 `~/.hermes/skills/` 拷，也不会被技能清理误删。内容包含何时调 `jev` / `jev_guard`、可直接抄的参数模板、结果字段读法、失败语义（error ≠ allow）与依赖桥自检步骤。
 
-**v1.4.0 代码整理（2026-10-19）**：拆出 `_build_jev_questions` / `_answers_from_response` / `_build_guard_questions` / `_guard_signals` / `_timeout_from_args` / `_cache_hit_json` / `_no_engine_json` / `_failure_json` 八个 helper，两个 handler 从约 190 / 153 行降到 54 / 63 行，`__init__.py` 从 859 行降到 753 行；顺手删掉重复的 adapter 可用性判断（`_jev_tool_available()` 已覆盖）、移除未使用的 `List` 导入、类型注解现代化（`Dict/Optional/List` → 内置 `dict/… | None`）。Ruff `F/E9/UP` 已清零，16 项行为测试全过，在线实弹（jev 路由 + guard 六信号）不变。剩余 BLE001/S110 属于工具层刻意保留的容错（异常不外抛、审计写失败静默）。
+**v1.4.1 脱敏加固 + 精简（2026-10-19）**：修掉两个实测漏洞——① 敏感键下的**非字符串值**（嵌套 dict/list）此前会明文透传，现在按键名一律整体遮蔽；② 补齐 `AIza…`（Google）、`xox*-…`（Slack）、JWT、PEM 私钥四种常见密钥形态。同时：磁盘缓存写盘移出工具调用主路径（线程池异步，进程退出前由 executor 兜底）；缓存键加入 `_CACHE_SCHEMA_VERSION`，结果结构变化后旧缓存自动失效；两份 schema 的公共参数（`timeout_seconds`/`no_cache`）合并为 `_TIMEOUT_PARAM`/`_NO_CACHE_PARAM`；统一 `_dump()` 序列化；删掉已无意义的 `advisory` 字段。17 项测试全过（新增结构化脱敏 + 新密钥形态回归）。
 
 ---
 

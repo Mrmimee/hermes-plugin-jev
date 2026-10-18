@@ -71,12 +71,14 @@ def _get_cache_dir() -> Path:
     return fallback
 
 
-_CACHE_FILE = _get_cache_dir() / "jev_cache.json"
-_JOURNAL_FILE = _get_cache_dir() / "jev_journal.jsonl"
+_CACHE_DIR = _get_cache_dir()
+_CACHE_FILE = _CACHE_DIR / "jev_cache.json"
+_JOURNAL_FILE = _CACHE_DIR / "jev_journal.jsonl"
 
 # LRU 决策缓存（上限 256 条，默认 3600 秒有效期）
 _CACHE_MAX_SIZE = 256
 _CACHE_TTL_SECONDS = 3600
+_CACHE_SCHEMA_VERSION = 2   # 结果结构变化时递增，旧格式缓存自然失效
 _DECISION_CACHE: collections.OrderedDict[str, tuple[float, dict]] = collections.OrderedDict()
 _CACHE_LOCK = threading.RLock()  # 保护 _DECISION_CACHE 的并发读写
 _DISK_LOCK = threading.Lock()     # 保护磁盘写（避免并发 write_text 竞态）
@@ -129,6 +131,8 @@ def _get_cache_key(args: dict[str, Any]) -> str:
         semantic_payload = {k: v for k, v in args.items() if k in semantic_keys}
         # 引擎/模型也进缓存键：换引擎或换 Jev 版本后不复用旧引擎的结论
         semantic_payload["__engine"] = _active_engine()
+        # 结果结构变化时递增，避免命中旧格式缓存（例如去掉 advisory 字段）
+        semantic_payload["__schema"] = _CACHE_SCHEMA_VERSION
         raw = json.dumps(semantic_payload, sort_keys=True, ensure_ascii=True)
     except Exception:
         raw = str(args)
@@ -152,12 +156,12 @@ def _cache_get(key: str) -> dict | None:
 
 
 def _cache_put(key: str, result: dict) -> None:
-    """写入缓存，超出容量时淘汰最老条目并持久化（锁保护）"""
+    """写入缓存，超出容量时淘汰最老条目；磁盘持久化丢给线程池（写失败仅丢缓存，不影响判定）"""
     with _CACHE_LOCK:
         if len(_DECISION_CACHE) >= _CACHE_MAX_SIZE:
             _DECISION_CACHE.popitem(last=False)
         _DECISION_CACHE[key] = (time.time(), result)
-    _save_disk_cache()
+    _executor.submit(_save_disk_cache)
 
 
 def _log_journal(entry: dict[str, Any]) -> None:
@@ -186,12 +190,7 @@ def _get_agnes_key() -> str:
     if key:
         return key
     # 兼容 OneDrive 重定向与原生英文/中文桌面路径
-    candidate_paths = [
-        Path.home() / "OneDrive" / "桌面" / "apikey.txt",
-        Path.home() / "Desktop" / "apikey.txt",
-        Path.home() / "桌面" / "apikey.txt",
-    ]
-    for key_file in candidate_paths:
+    for key_file in (Path.home() / "OneDrive" / "桌面" / "apikey.txt", Path.home() / "Desktop" / "apikey.txt"):
         if key_file.exists():
             lines = key_file.read_text(encoding="utf-8").splitlines()
             for i, line in enumerate(lines):
@@ -214,24 +213,25 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9]{16,}"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}"),                      # Google API key
+    re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}"),                # Slack token
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),  # JWT
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),             # PEM 私钥
     re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|secret|password|passwd|token)\b\s*[:=]\s*[^\s,;\"']{6,}"),
 )
 
 
-# 会触发“整值脱敏”的键名（结构化 state 里出现这些键，值直接遮蔽）
+# 会触发“整值脱敏”的键名（结构化 state 里出现这些键，值直接遮蔽，不论值是不是字符串）
 _SENSITIVE_KEYS = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|credential|auth)")
 
 
 def _redact(value: Any) -> Any:
-    """脱敏：遮蔽 state 里的密钥/令牌/口令（字符串、字典、列表均可）。"""
+    """脱敏：遮蔽 state 里的密钥/令牌/口令（字符串、字典、列表均可；敏感键下的任何值都整体遮蔽）。"""
     if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, val in value.items():
-            if isinstance(val, str) and _SENSITIVE_KEYS.search(str(key)):
-                out[key] = "[REDACTED]"          # 键名本身就说明这是凭据 → 值整体遮蔽
-            else:
-                out[key] = _redact(val)
-        return out
+        return {
+            key: "[REDACTED]" if _SENSITIVE_KEYS.search(str(key)) else _redact(val)
+            for key, val in value.items()
+        }
     if isinstance(value, list):
         return [_redact(item) for item in value]
     text = str(value)
@@ -296,6 +296,16 @@ def _jev_tool_available() -> bool:
 
 
 # 2. 工具定义 Schema
+# 两个工具共用的控制参数（避免在两份 schema 里重复写同一段描述）
+_TIMEOUT_PARAM = {
+    "type": "number",
+    "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时直接返回 error，不做本地兜底。",
+}
+_NO_CACHE_PARAM = {
+    "type": "boolean",
+    "description": "是否跳过本地缓存强制实时推理（默认 false）。",
+}
+
 JEV_SCHEMA = {
     "name": "jev",
     "description": (
@@ -385,14 +395,8 @@ JEV_SCHEMA = {
                     "required": ["criteria"],
                 },
             },
-            "timeout_seconds": {
-                "type": "number",
-                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时直接返回 error，不做本地兜底。",
-            },
-            "no_cache": {
-                "type": "boolean",
-                "description": "是否跳过本地缓存强制实时推理（默认 false）。",
-            },
+            "timeout_seconds": dict(_TIMEOUT_PARAM),
+            "no_cache": dict(_NO_CACHE_PARAM),
         },
         "required": ["state"],
     },
@@ -429,14 +433,8 @@ JEV_GUARD_SCHEMA = {
                     },
                 },
             },
-            "timeout_seconds": {
-                "type": "number",
-                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时直接返回 error，不做本地兜底。",
-            },
-            "no_cache": {
-                "type": "boolean",
-                "description": "是否跳过本地缓存强制实时推理（默认 false）。",
-            },
+            "timeout_seconds": dict(_TIMEOUT_PARAM),
+            "no_cache": dict(_NO_CACHE_PARAM),
         },
         "required": ["state"],
     },
@@ -476,6 +474,11 @@ def _execute_system_one_with_timeout(
     return fut.result(timeout=timeout)
 
 
+def _dump(payload: Any) -> str:
+    """工具结果统一序列化：ensure_ascii=False 让模型直接看到中文，2 空格缩进便于阅读。"""
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _timeout_from_args(args: dict, default: float = _DEFAULT_TIMEOUT_SECONDS) -> float:
     try:
         return max(0.1, min(float(args.get("timeout_seconds") or default), 120.0))
@@ -490,7 +493,7 @@ def _cache_hit_json(tool: str, args: dict, state: Any, use_cache: bool):
         if hit is not None:
             _log_journal({"tool": tool, "cache_hit": True, "latency_seconds": 0.0,
                           "state_preview": str(state)[:100]})
-            return json.dumps(hit, ensure_ascii=False, indent=2), cache_key
+            return _dump(hit), cache_key
     return None, cache_key
 
 
@@ -501,11 +504,11 @@ def _no_engine_json(tool: str, state: Any) -> str:
         if tool == "jev_guard"
         else "Jev 在线裁决不可用：当前没有可用引擎，本次未做任何判定。"
     )
-    return json.dumps({
+    return _dump({
         "error": message,
         "engine": _ENGINE_NONE,
         "hint": "需要 AGNES_API_KEY + 可导入的 system_one_adapter；拿不到 verdict 就不要当成 allow。",
-    }, ensure_ascii=False, indent=2)
+    })
 
 
 def _failure_json(tool: str, state: Any, error: Exception, timeout: float) -> str:
@@ -523,9 +526,7 @@ def _failure_json(tool: str, state: Any, error: Exception, timeout: float) -> st
     else:
         message = f"在线裁决失败：{type(error).__name__}: {error}"
         latency = 0.0
-    return json.dumps({
-        "error": message, "engine": _active_engine(), "latency_seconds": latency,
-    }, ensure_ascii=False, indent=2)
+    return _dump({"error": message, "engine": _active_engine(), "latency_seconds": latency})
 
 
 def _build_jev_questions(args: dict) -> tuple[dict, dict]:
@@ -600,7 +601,7 @@ def _guard_signals(response: Any) -> dict:
 def _handle_jev(args: dict[str, Any], **kwargs) -> str:
     """Build questions, call Agnes, and return structured answers; failures stay explicit."""
     if args.get("state") is None:
-        return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
+        return _dump({"error": "缺少 state（系统当前状态）参数。"})
     state = _redact(args["state"])
     timeout = _timeout_from_args(args)
     use_cache = not args.get("no_cache", False)
@@ -612,10 +613,10 @@ def _handle_jev(args: dict[str, Any], **kwargs) -> str:
 
     questions, configs = _build_jev_questions(args)
     if not questions:
-        return json.dumps({
+        return _dump({
             "error": "没有提供任何判定题目，请提供 choice/choices、noul/nouls 或 score/scores 之一。",
             "tip": "支持多题并发传入，一次网络往返即可返回所有题目答案。",
-        }, ensure_ascii=False)
+        })
 
     try:
         started = time.time()
@@ -631,7 +632,6 @@ def _handle_jev(args: dict[str, Any], **kwargs) -> str:
         result = {
             "latency_seconds": elapsed,
             "cache_hit": False,
-            "advisory": False,
             "engine": getattr(response, "engine", _ENGINE_AGNES),
             "model": getattr(response, "model", _MODEL_NAME),
             "answers": answers,
@@ -648,7 +648,7 @@ def _handle_jev(args: dict[str, Any], **kwargs) -> str:
             _cache_put(cache_key, result)
         _log_journal({"tool": "jev", "latency_seconds": elapsed, "questions_count": len(questions),
                       "answers": answers, "state_preview": str(state)[:100]})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return _dump(result)
     except Exception as exc:
         return _failure_json("jev", state, exc, timeout)
 
@@ -656,7 +656,7 @@ def _handle_jev(args: dict[str, Any], **kwargs) -> str:
 def _handle_jev_guard(args: dict[str, Any], **kwargs) -> str:
     """Run six-signal guard; unavailable/failed calls return errors without a local verdict."""
     if args.get("state") is None:
-        return json.dumps({"error": "缺少 state（待执行动作描述）参数。"}, ensure_ascii=False)
+        return _dump({"error": "缺少 state（待执行动作描述）参数。"})
     state = _redact(args["state"])
     timeout = _timeout_from_args(args)
     use_cache = not args.get("no_cache", False)
@@ -705,7 +705,6 @@ def _handle_jev_guard(args: dict[str, Any], **kwargs) -> str:
             "reason": reason,
             "engine": getattr(response, "engine", _ENGINE_AGNES),
             "model": getattr(response, "model", _MODEL_NAME),
-            "advisory": False,
             "latency_seconds": elapsed,
             "cache_hit": False,
         }
@@ -713,7 +712,7 @@ def _handle_jev_guard(args: dict[str, Any], **kwargs) -> str:
             _cache_put(cache_key, result)
         _log_journal({"tool": "jev_guard", "verdict": verdict, "probability": probability,
                       "latency_seconds": elapsed, "state_preview": str(state)[:100]})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return _dump(result)
     except Exception as exc:
         return _failure_json("jev_guard", state, exc, timeout)
 
