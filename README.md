@@ -206,7 +206,7 @@ hermes-plugin-jev/
 插件在 `register()` 里调用 `ctx.register_skill(...)` 把 `skills/jev-decision-engine/SKILL.md` 注册为插件技能：
 **克隆/更新仓库就自带这份技能**，不需要单独往 `~/.hermes/skills/` 拷，也不会被技能清理误删。内容包含何时调 `jev` / `jev_guard`、可直接抄的参数模板、结果字段读法、失败语义（error ≠ allow）与依赖桥自检步骤。
 
-**代码可维护性复核（2026-10-19）**：现有行为测试 16 项全过，`py_compile` 通过；静态检查发现 13 条提示，主要是旧式 `typing` 注解和未使用导入。两个核心 handler 约 190 / 153 行，题目解析、缓存、调用、结果整形与错误处理耦合，建议后续拆小 helper。无阻断性运行问题，未做大规模重构。已修正 README 中“会自动调用 / 自动风险判定”的不实描述：Jev 是按需工具，没有全局 hook。
+**v1.4.0 代码整理（2026-10-19）**：拆出 `_build_jev_questions` / `_answers_from_response` / `_build_guard_questions` / `_guard_signals` / `_timeout_from_args` / `_cache_hit_json` / `_no_engine_json` / `_failure_json` 八个 helper，两个 handler 从约 190 / 153 行降到 54 / 63 行，`__init__.py` 从 859 行降到 753 行；顺手删掉重复的 adapter 可用性判断（`_jev_tool_available()` 已覆盖）、移除未使用的 `List` 导入、类型注解现代化（`Dict/Optional/List` → 内置 `dict/… | None`）。Ruff `F/E9/UP` 已清零，16 项行为测试全过，在线实弹（jev 路由 + guard 六信号）不变。剩余 BLE001/S110 属于工具层刻意保留的容错（异常不外抛、审计写失败静默）。
 
 ---
 

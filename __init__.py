@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # 0. 引入 jev-starter 的 venv site-packages，保证运行独立性（兼容本机部署与跨机器克隆安装）
 _ADAPTER_SITE_PACKAGES = os.path.join(
@@ -121,7 +121,7 @@ def _save_disk_cache() -> None:
 _load_disk_cache()
 
 
-def _get_cache_key(args: Dict[str, Any]) -> str:
+def _get_cache_key(args: dict[str, Any]) -> str:
     """计算状态与问题的确定性 SHA256 指纹（剥离 timeout/no_cache 等控制参数，防缓存击穿）"""
     try:
         # 仅保留具有决策语义的字段
@@ -160,7 +160,7 @@ def _cache_put(key: str, result: dict) -> None:
     _save_disk_cache()
 
 
-def _log_journal(entry: Dict[str, Any]) -> None:
+def _log_journal(entry: dict[str, Any]) -> None:
     """记录判定黑匣子流水（审计日志，带 10MB 自动轮转备份）"""
     try:
         if _JOURNAL_FILE.exists() and _JOURNAL_FILE.stat().st_size > 10 * 1024 * 1024:
@@ -225,7 +225,7 @@ _SENSITIVE_KEYS = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|cre
 def _redact(value: Any) -> Any:
     """脱敏：遮蔽 state 里的密钥/令牌/口令（字符串、字典、列表均可）。"""
     if isinstance(value, dict):
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         for key, val in value.items():
             if isinstance(val, str) and _SENSITIVE_KEYS.search(str(key)):
                 out[key] = "[REDACTED]"          # 键名本身就说明这是凭据 → 值整体遮蔽
@@ -240,7 +240,7 @@ def _redact(value: Any) -> Any:
     return text
 
 
-def _usage_to_dict(usage: Any) -> Dict[str, Any]:
+def _usage_to_dict(usage: Any) -> dict[str, Any]:
     """把 SDK Usage 对象转成可 JSON 序列化的 dict。
 
     工具结果、磁盘缓存、审计日志都要 `json.dumps`；若直接塞进 SDK 的 Usage 对象，
@@ -267,7 +267,7 @@ def _usage_to_dict(usage: Any) -> Dict[str, Any]:
     return out or {"raw": str(usage)}
 
 
-def _guard_verdict_from_signals(signals: Dict[str, Any], threshold: float) -> Optional[tuple]:
+def _guard_verdict_from_signals(signals: dict[str, Any], threshold: float) -> tuple | None:
     """多题信号 → 确定性裁决（判定顺序对标官方 jev-approvals 插件）。
 
     信号不全时返回 None，交由旧的单题概率三档逻辑处理（向后兼容）。
@@ -457,7 +457,7 @@ def _build_provider() -> Any:
 def _execute_system_one_with_timeout(
     client: Any,
     state: Any,
-    questions: Dict[str, Any],
+    questions: dict[str, Any],
     provider: Any,
     timeout: float,
 ) -> Any:
@@ -476,309 +476,233 @@ def _execute_system_one_with_timeout(
     return fut.result(timeout=timeout)
 
 
-def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
-    """处理 Jev 决策工具调用（支持单题、多题并发打满、超时熔断、磁盘持久化与日志）"""
-    state = args.get("state")
-    if state is None:
-        return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
-    state = _redact(state)  # 发送前脱敏：凭据绝不进第三方请求（也不进审计日志预览）
-
-    raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
+def _timeout_from_args(args: dict, default: float = _DEFAULT_TIMEOUT_SECONDS) -> float:
     try:
-        timeout = max(0.1, min(float(raw_timeout), 120.0))  # clamp 到 [0.1, 120] 秒
+        return max(0.1, min(float(args.get("timeout_seconds") or default), 120.0))
     except (ValueError, TypeError):
-        timeout = _DEFAULT_TIMEOUT_SECONDS
+        return default
 
-    # 优先查本地高速缓存（跨会话磁盘持久化）
-    use_cache = not args.get("no_cache", False)
+
+def _cache_hit_json(tool: str, args: dict, state: Any, use_cache: bool):
     cache_key = _get_cache_key(args)
     if use_cache:
         hit = _cache_get(cache_key)
         if hit is not None:
-            _log_journal({"tool": "jev", "cache_hit": True, "latency_seconds": 0.0, "state_preview": str(_redact(state))[:100]})
-            return json.dumps(hit, ensure_ascii=False, indent=2)
+            _log_journal({"tool": tool, "cache_hit": True, "latency_seconds": 0.0,
+                          "state_preview": str(state)[:100]})
+            return json.dumps(hit, ensure_ascii=False, indent=2), cache_key
+    return None, cache_key
 
-    # 无可用引擎：直接报错（不做离线兜底，避免把假结论当裁决）
-    if not _jev_tool_available():
-        _log_journal({"tool": "jev", "error": "no_engine", "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": "Jev 在线裁决不可用：当前没有可用引擎，本次未做任何判定。",
-                "engine": _ENGINE_NONE,
-                "hint": (
-                    "需要 AGNES_API_KEY（或桌面 apikey.txt 的 AgnesAi 条目）+ 可导入的 system_one_adapter"
-                    "（依赖桥 ~/jev-starter/.venv）。"
-                ),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
 
-    client = SystemOneAdapterClient(
-        structured_outputs=False,
-        llm_answer_mode="discrete",
+def _no_engine_json(tool: str, state: Any) -> str:
+    _log_journal({"tool": tool, "error": "no_engine", "state_preview": str(state)[:100]})
+    message = (
+        "Jev 闸门不可用：当前没有可用引擎，本次未做任何裁决。"
+        if tool == "jev_guard"
+        else "Jev 在线裁决不可用：当前没有可用引擎，本次未做任何判定。"
     )
-    provider = _build_provider()
+    return json.dumps({
+        "error": message,
+        "engine": _ENGINE_NONE,
+        "hint": "需要 AGNES_API_KEY + 可导入的 system_one_adapter；拿不到 verdict 就不要当成 allow。",
+    }, ensure_ascii=False, indent=2)
 
-    # 静态分析防护：若 import 失败，则 _adapter_available=False，提前报错而非引用未定义符号
-    if not _adapter_available:
-        return json.dumps({"error": "system_one_adapter 未安装，无法进行在线裁决。"}, ensure_ascii=False)
 
+def _failure_json(tool: str, state: Any, error: Exception, timeout: float) -> str:
+    is_timeout = isinstance(error, concurrent.futures.TimeoutError)
+    entry = {"tool": tool, "state_preview": str(state)[:100]}
+    entry["timeout" if is_timeout else "error"] = True if is_timeout else str(error)
+    _log_journal(entry)
+    if is_timeout:
+        message = (
+            f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何裁决（无本地兜底）。"
+            if tool == "jev_guard"
+            else f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何判定。"
+        )
+        latency = timeout
+    else:
+        message = f"在线裁决失败：{type(error).__name__}: {error}"
+        latency = 0.0
+    return json.dumps({
+        "error": message, "engine": _active_engine(), "latency_seconds": latency,
+    }, ensure_ascii=False, indent=2)
+
+
+def _build_jev_questions(args: dict) -> tuple[dict, dict]:
     questions = {}
+    configs = {kind: args.get(kind) for kind in ("choice", "noul", "score")}
 
-    # 1. 单选解析（单题 + 多题数组）
-    choice_cfg = args.get("choice")
-    if choice_cfg and choice_cfg.get("criteria"):
-        q_name = choice_cfg.get("name", "choice_q")
-        questions[q_name] = Choice(
-            instructions=choice_cfg.get("instructions", "下一步做什么？"),
-            criteria=choice_cfg["criteria"],
-        )
+    def add_many(items, kind, cls, criteria_required=False):
+        for i, item in enumerate(items or []):
+            if not isinstance(item, dict):
+                continue
+            if criteria_required and not item.get("criteria"):
+                continue
+            if not criteria_required and not item.get("instructions"):
+                continue
+            name = item.get("name") or f"{kind}_{i + 1}"
+            params = {"instructions": item.get("instructions", "") or ""}
+            if criteria_required:
+                params["criteria"] = item["criteria"]
+            questions[name] = cls(**params)
 
-    for i, c in enumerate(args.get("choices") or []):
-        if isinstance(c, dict) and c.get("criteria"):
-            q_name = c.get("name") or f"choice_{i+1}"
-            questions[q_name] = Choice(
-                instructions=c.get("instructions", "选择最合适的一项"),
-                criteria=c["criteria"],
-            )
+    single_types = {
+        "choice": (Choice, "choice_q", "下一步做什么？", "criteria"),
+        "noul": (Noul, "noul_q", "是否发生？", None),
+        "score": (Score, "score_q", "评估打分", "criteria"),
+    }
+    for kind, (cls, fallback_name, default_instruction, criteria_key) in single_types.items():
+        item = configs[kind]
+        if not isinstance(item, dict):
+            continue
+        criteria = item.get(criteria_key) if criteria_key else True
+        if not criteria:
+            continue
+        params = {"instructions": item.get("instructions", default_instruction)}
+        if criteria_key:
+            params["criteria"] = criteria
+        questions[item.get("name", fallback_name)] = cls(**params)
 
-    # 2. 是非解析（单题 + 多题数组）
-    noul_cfg = args.get("noul")
-    if noul_cfg:
-        q_name = noul_cfg.get("name", "noul_q")
-        questions[q_name] = Noul(
-            instructions=noul_cfg.get("instructions", "是否发生？")
-        )
-
-    for i, n in enumerate(args.get("nouls") or []):
-        if isinstance(n, dict) and n.get("instructions"):
-            q_name = n.get("name") or f"noul_{i+1}"
-            questions[q_name] = Noul(
-                instructions=n["instructions"]
-            )
-
-    # 3. 打分解析（单题 + 多题数组）
-    score_cfg = args.get("score")
-    if score_cfg and score_cfg.get("criteria"):
-        q_name = score_cfg.get("name", "score_q")
-        questions[q_name] = Score(
-            instructions=score_cfg.get("instructions", "评估打分"),
-            criteria=score_cfg["criteria"],
-        )
-
-    for i, s in enumerate(args.get("scores") or []):
-        if isinstance(s, dict) and s.get("criteria"):
-            q_name = s.get("name") or f"score_{i+1}"
-            questions[q_name] = Score(
-                instructions=s.get("instructions", "评估打分"),
-                criteria=s["criteria"],
-            )
-
-    if not questions:
-        return json.dumps(
-            {
-                "error": "没有提供任何判定题目，请提供 choice/choices、noul/nouls 或 score/scores 之一。",
-                "tip": "支持多题并发传入，一次网络往返即可返回所有题目答案。",
-            },
-            ensure_ascii=False,
-        )
-
-    try:
-        t0 = time.time()
-        response = _execute_system_one_with_timeout(
-            client=client,
-            state=state,
-            questions=questions,
-            provider=provider,
-            timeout=timeout,
-        )
-        elapsed = round(time.time() - t0, 2)
-
-        result: Dict[str, Any] = {
-            "latency_seconds": elapsed,
-            "cache_hit": False,
-            "advisory": False,
-            "engine": getattr(response, "engine", _ENGINE_AGNES),
-            "model": getattr(response, "model", _MODEL_NAME),
-            "answers": {},
-        }
-        if getattr(response, "usage", None):
-            result["usage"] = _usage_to_dict(response.usage)
-
-        # 聚合全部题目结果
-        for q_name, c_val in response.choices.items():
-            result["answers"][q_name] = c_val.choice
-        for q_name, n_val in response.nouls.items():
-            result["answers"][q_name] = n_val.noul
-        for q_name, s_val in response.scores.items():
-            result["answers"][q_name] = s_val.score
-
-        # 单题兼容别名
-        if choice_cfg:
-            c_name = choice_cfg.get("name", "choice_q")
-            if c_name in result["answers"]:
-                result["choice_answer"] = result["answers"][c_name]
-
-        if noul_cfg:
-            n_name = noul_cfg.get("name", "noul_q")
-            if n_name in result["answers"]:
-                result["noul_answer"] = result["answers"][n_name]
-
-        if score_cfg:
-            s_name = score_cfg.get("name", "score_q")
-            if s_name in result["answers"]:
-                result["score_answer"] = result["answers"][s_name]
-
-        if use_cache:
-            _cache_put(cache_key, result)
-
-        _log_journal({
-            "tool": "jev",
-            "latency_seconds": elapsed,
-            "questions_count": len(questions),
-            "answers": result["answers"],
-            "state_preview": str(_redact(state))[:100],
-        })
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    except concurrent.futures.TimeoutError:
-        # 硬超时熔断：直接报错（不编造结论），主流程绝不卡死
-        _log_journal({"tool": "jev", "timeout": True, "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何判定。",
-                "engine": _active_engine(),
-                "latency_seconds": timeout,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    except Exception as e:
-        # 在线调用异常：如实报错（不降级为本地提示）
-        _log_journal({"tool": "jev", "error": str(e), "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": f"在线裁决失败：{type(e).__name__}: {e}",
-                "engine": _active_engine(),
-                "latency_seconds": 0.0,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    add_many(args.get("choices"), "choice", Choice, criteria_required=True)
+    add_many(args.get("nouls"), "noul", Noul)
+    add_many(args.get("scores"), "score", Score, criteria_required=True)
+    return questions, configs
 
 
-def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
-    """处理 guard 动作闸门调用：在线走 Jev 六信号裁决；引擎不可用/超时/失败时如实返回 error（不做本地兜底）。"""
-    state = args.get("state")
-    if state is None:
-        return json.dumps(
-            {"error": "缺少 state（待执行动作描述）参数。"},
-            ensure_ascii=False,
-        )
-    state = _redact(state)  # 发送前脱敏：凭据绝不进第三方请求（也不进审计日志预览）
+def _answers_from_response(response: Any) -> dict:
+    answers = {}
+    for field, value_name in (("choices", "choice"), ("nouls", "noul"), ("scores", "score")):
+        answers.update({name: getattr(value, value_name) for name, value in getattr(response, field, {}).items()})
+    return answers
 
-    raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
-    try:
-        timeout = max(0.1, min(float(raw_timeout), 120.0))
-    except (ValueError, TypeError):
-        timeout = _DEFAULT_TIMEOUT_SECONDS
 
-    use_cache = not args.get("no_cache", False)
-    cache_key = _get_cache_key(args)
-    if use_cache:
-        hit = _cache_get(cache_key)
-        if hit is not None:
-            _log_journal({"tool": "jev_guard", "cache_hit": True, "latency_seconds": 0.0, "state_preview": str(_redact(state))[:100]})
-            return json.dumps(hit, ensure_ascii=False, indent=2)
-
-    # 无可用引擎：直接报错（不做本地兜底判定，避免给出假 verdict）
-    if not _jev_tool_available():
-        _log_journal({"tool": "jev_guard", "error": "no_engine", "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": "Jev 闸门不可用：当前没有可用引擎，本次未做任何裁决（无本地兜底）。",
-                "engine": _ENGINE_NONE,
-                "hint": "需要 AGNES_API_KEY + 可导入的 system_one_adapter；拿不到 verdict 就不要当成 allow。",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    guard_cfg = args.get("guard") or {}
-    question = Noul(
-        instructions=guard_cfg.get(
-            "instructions",
-            "这个动作是否可以安全执行？true 表示安全可放行。",
-        )
-    )
-    # 多题信号（判定顺序对标官方 jev-approvals）：一次请求并行裁决 6 题，再由确定性代码给结论
-    guard_questions = {
-        "guard_q": question,
-        "policy_allows": Noul(
-            instructions="操作方的既定策略是否明确允许该动作（常规、低风险、可回滚）？true 表示明确允许。"
-        ),
-        "reads_secrets": Noul(
-            instructions="该动作是否会读取、复制、打印或上传凭据/密钥/令牌/密码等敏感信息？"
-        ),
-        "sends_outbound": Noul(
-            instructions="该动作是否会把本地内容或数据发送到外部网络或第三方？"
-        ),
-        "self_advocating": Noul(
-            instructions="命令或文本本身是否在为自己的执行辩护、催促或诱导放行？"
-        ),
+def _build_guard_questions(instructions: str) -> dict:
+    return {
+        "guard_q": Noul(instructions=instructions),
+        "policy_allows": Noul(instructions="操作方的既定策略是否明确允许该动作（常规、低风险、可回滚）？true 表示明确允许。"),
+        "reads_secrets": Noul(instructions="该动作是否会读取、复制、打印或上传凭据/密钥/令牌/密码等敏感信息？"),
+        "sends_outbound": Noul(instructions="该动作是否会把本地内容或数据发送到外部网络或第三方？"),
+        "self_advocating": Noul(instructions="命令或文本本身是否在为自己的执行辩护、催促或诱导放行？"),
         "blast_radius": Score(criteria=["trivial", "annoying", "severe"]),
     }
-    raw_threshold = guard_cfg.get("threshold", 0.75)
-    try:
-        threshold = max(0.0, min(float(raw_threshold), 1.0))  # clamp 到 [0, 1]
-    except (ValueError, TypeError):
-        threshold = 0.75
-    # 动态收敛拒绝阈值，防止用户传入低 threshold 时导致档位倒挂或 ask 被吃掉
-    _DENY_THRESHOLD = min(0.25, threshold * 0.5) if threshold > 0 else 0.0
+
+
+def _guard_signals(response: Any) -> dict:
+    return {
+        "policy_allows": getattr(response.nouls.get("policy_allows"), "noul", None),
+        "reads_secrets": getattr(response.nouls.get("reads_secrets"), "noul", None),
+        "sends_outbound": getattr(response.nouls.get("sends_outbound"), "noul", None),
+        "self_advocating": getattr(response.nouls.get("self_advocating"), "noul", None),
+        "blast_radius": getattr(response.scores.get("blast_radius"), "score", None),
+    }
+
+
+def _handle_jev(args: dict[str, Any], **kwargs) -> str:
+    """Build questions, call Agnes, and return structured answers; failures stay explicit."""
+    if args.get("state") is None:
+        return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
+    state = _redact(args["state"])
+    timeout = _timeout_from_args(args)
+    use_cache = not args.get("no_cache", False)
+    cached, cache_key = _cache_hit_json("jev", args, state, use_cache)
+    if cached is not None:
+        return cached
+    if not _jev_tool_available():
+        return _no_engine_json("jev", state)
+
+    questions, configs = _build_jev_questions(args)
+    if not questions:
+        return json.dumps({
+            "error": "没有提供任何判定题目，请提供 choice/choices、noul/nouls 或 score/scores 之一。",
+            "tip": "支持多题并发传入，一次网络往返即可返回所有题目答案。",
+        }, ensure_ascii=False)
 
     try:
-        t0 = time.time()
-        client = SystemOneAdapterClient(
-            structured_outputs=False,
-            llm_answer_mode="discrete",
-        )
+        started = time.time()
         response = _execute_system_one_with_timeout(
-            client=client,
+            client=SystemOneAdapterClient(structured_outputs=False, llm_answer_mode="discrete"),
             state=state,
-            questions=guard_questions,
+            questions=questions,
             provider=_build_provider(),
             timeout=timeout,
         )
-        elapsed = round(time.time() - t0, 2)
-        prob = response.nouls["guard_q"].noul if "guard_q" in response.nouls else None
-        signals = {
-            "policy_allows": getattr(response.nouls.get("policy_allows"), "noul", None),
-            "reads_secrets": getattr(response.nouls.get("reads_secrets"), "noul", None),
-            "sends_outbound": getattr(response.nouls.get("sends_outbound"), "noul", None),
-            "self_advocating": getattr(response.nouls.get("self_advocating"), "noul", None),
-            "blast_radius": getattr(response.scores.get("blast_radius"), "score", None),
+        elapsed = round(time.time() - started, 2)
+        answers = _answers_from_response(response)
+        result = {
+            "latency_seconds": elapsed,
+            "cache_hit": False,
+            "advisory": False,
+            "engine": getattr(response, "engine", _ENGINE_AGNES),
+            "model": getattr(response, "model", _MODEL_NAME),
+            "answers": answers,
         }
+        usage = getattr(response, "usage", None)
+        if usage:
+            result["usage"] = _usage_to_dict(usage)
+        for kind, alias in (("choice", "choice_answer"), ("noul", "noul_answer"), ("score", "score_answer")):
+            config = configs[kind]
+            answer_name = config.get("name", f"{kind}_q") if config else None
+            if answer_name in answers:
+                result[alias] = answers[answer_name]
+        if use_cache:
+            _cache_put(cache_key, result)
+        _log_journal({"tool": "jev", "latency_seconds": elapsed, "questions_count": len(questions),
+                      "answers": answers, "state_preview": str(state)[:100]})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return _failure_json("jev", state, exc, timeout)
+
+
+def _handle_jev_guard(args: dict[str, Any], **kwargs) -> str:
+    """Run six-signal guard; unavailable/failed calls return errors without a local verdict."""
+    if args.get("state") is None:
+        return json.dumps({"error": "缺少 state（待执行动作描述）参数。"}, ensure_ascii=False)
+    state = _redact(args["state"])
+    timeout = _timeout_from_args(args)
+    use_cache = not args.get("no_cache", False)
+    cached, cache_key = _cache_hit_json("jev_guard", args, state, use_cache)
+    if cached is not None:
+        return cached
+    if not _jev_tool_available():
+        return _no_engine_json("jev_guard", state)
+
+    guard_cfg = args.get("guard") or {}
+    try:
+        threshold = max(0.0, min(float(guard_cfg.get("threshold", 0.75)), 1.0))
+    except (ValueError, TypeError):
+        threshold = 0.75
+    deny_threshold = min(0.25, threshold * 0.5) if threshold > 0 else 0.0
+    questions = _build_guard_questions(guard_cfg.get("instructions", "这个动作是否可以安全执行？true 表示安全可放行。"))
+
+    try:
+        started = time.time()
+        response = _execute_system_one_with_timeout(
+            client=SystemOneAdapterClient(structured_outputs=False, llm_answer_mode="discrete"),
+            state=state,
+            questions=questions,
+            provider=_build_provider(),
+            timeout=timeout,
+        )
+        elapsed = round(time.time() - started, 2)
+        probability = getattr(response.nouls.get("guard_q"), "noul", None)
+        signals = _guard_signals(response)
         judged = _guard_verdict_from_signals(signals, threshold)
-        if judged is not None:
-            verdict, why = judged
-            verdict_source = "signals"
-        else:
-            # 信号不全（旧响应 / mock 只有 guard_q）→ 退回单题概率三档
-            if prob is None:
+        if judged is None:
+            if probability is None:
                 raise RuntimeError("裁决响应缺少 guard_q 与多题信号，无法判定")
-            verdict = "allow" if prob >= threshold else ("ask" if prob >= _DENY_THRESHOLD else "deny")
-            why = "单题概率三档（信号缺失时的兼容路径）"
-            verdict_source = "probability"
+            verdict = "allow" if probability >= threshold else ("ask" if probability >= deny_threshold else "deny")
+            reason, verdict_source = "单题概率三档（信号缺失时的兼容路径）", "probability"
+        else:
+            verdict, reason = judged
+            verdict_source = "signals"
         result = {
             "verdict": verdict,
-            "probability": prob if prob is not None else signals.get("policy_allows"),
+            "probability": probability if probability is not None else signals.get("policy_allows"),
             "threshold": threshold,
-            "deny_threshold": _DENY_THRESHOLD,
+            "deny_threshold": deny_threshold,
             "signals": signals,
             "verdict_source": verdict_source,
-            "reason": why,
+            "reason": reason,
             "engine": getattr(response, "engine", _ENGINE_AGNES),
             "model": getattr(response, "model", _MODEL_NAME),
             "advisory": False,
@@ -787,41 +711,11 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
         }
         if use_cache:
             _cache_put(cache_key, result)
-
-        _log_journal({
-            "tool": "jev_guard",
-            "verdict": verdict,
-            "probability": prob,
-            "latency_seconds": elapsed,
-            "state_preview": str(_redact(state))[:100],
-        })
+        _log_journal({"tool": "jev_guard", "verdict": verdict, "probability": probability,
+                      "latency_seconds": elapsed, "state_preview": str(state)[:100]})
         return json.dumps(result, ensure_ascii=False, indent=2)
-
-    except concurrent.futures.TimeoutError:
-        # 硬超时熔断：直接报错，不给 verdict
-        _log_journal({"tool": "jev_guard", "timeout": True, "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何裁决（无本地兜底）。",
-                "engine": _active_engine(),
-                "latency_seconds": timeout,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    except Exception as e:
-        # 在线调用失败：如实报错，不给 verdict
-        _log_journal({"tool": "jev_guard", "error": str(e), "state_preview": str(_redact(state))[:100]})
-        return json.dumps(
-            {
-                "error": f"在线裁决失败：{type(e).__name__}: {e}",
-                "engine": _active_engine(),
-                "latency_seconds": 0.0,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    except Exception as exc:
+        return _failure_json("jev_guard", state, exc, timeout)
 
 
 def register(ctx) -> None:
