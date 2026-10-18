@@ -42,7 +42,7 @@ def restore_online(orig):
 
 # ---------- 测试用例 ----------
 def test_availability():
-    """有 key + adapter 时装载可用；无 key 时离线降级但不崩。"""
+    """有 key + adapter 时装载可用；无 key 时工具不可用（调用时直接报错，不编造结论）。"""
     jmod._adapter_available = True
     jmod._get_agnes_key = lambda: "fake-key-for-test"
     assert jmod._jev_tool_available() is True
@@ -53,20 +53,33 @@ def test_availability():
     assert "无关个人内容" in jmod.JEV_SCHEMA["parameters"]["properties"]["state"]["description"]
     guard_description = jmod.JEV_GUARD_SCHEMA["description"]
     assert "普通低风险工具调用无需逐次运行 guard" in guard_description
-    assert "不能作为放行凭据" in guard_description
+    assert "不要当作放行凭据" in guard_description
     assert "移除密钥、令牌、密码" in jmod.JEV_GUARD_SCHEMA["parameters"]["properties"]["state"]["description"]
     print("Availability and on-demand routing guidance: PASSED")
 
 
-def test_guard_offline_rules():
-    """离线降级规则单元：高危 deny、破坏性词 ask、普通文本 allow。"""
-    r = jmod._local_guard_verdict({"state": "执行 rm -rf / 清空所有数据"})
-    assert r["verdict"] == "deny" and r["advisory"] is True, r
-    r2 = jmod._local_guard_verdict({"state": "删除旧缓存文件"})
-    assert r2["verdict"] == "ask" and r2["advisory"] is True, r2
-    r3 = jmod._local_guard_verdict({"state": "读取 config.yaml 配置文件"})
-    assert r3["verdict"] == "allow" and r3["advisory"] is True, r3
-    print("Guard offline rules: PASSED")
+def test_no_engine_returns_explicit_error():
+    """无可用引擎（无 key / adapter 缺失）：jev 与 guard 都直接报错，不给 verdict、不编造结论。"""
+    jmod._adapter_available = False
+    jmod._get_agnes_key = lambda: ""
+    assert jmod._active_engine() == "none"
+    assert jmod._jev_tool_available() is False
+
+    r = json.loads(jmod._handle_jev({
+        "state": "无引擎测试",
+        "noul": {"name": "q", "instructions": "是否？"},
+        "no_cache": True,
+    }))
+    assert "error" in r and r["engine"] == "none", r
+    assert "verdict" not in r and "answers" not in r, r
+
+    rg = json.loads(jmod._handle_jev_guard({"state": "删除旧缓存文件", "no_cache": True}))
+    assert "error" in rg and rg["engine"] == "none", rg
+    assert "verdict" not in rg, rg  # 不再有本地离线兜底判定
+
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+    print("No engine -> explicit error (no local fallback): PASSED")
 
 
 def test_guard_online_three_tiers():
@@ -93,8 +106,8 @@ def test_guard_online_three_tiers():
     print("Guard online three-tier (allow/ask/deny): PASSED")
 
 
-def test_guard_online_timeout_fallback():
-    """在线 guard 超时 → 熔断降级本地 fail-closed 规则。"""
+def test_guard_online_timeout_stops_clean():
+    """在线 guard 超时 → 直接返回 error，不做本地兜底判定。"""
     jmod._adapter_available = True
     jmod._get_agnes_key = lambda: "fake"
     import concurrent.futures
@@ -107,10 +120,9 @@ def test_guard_online_timeout_fallback():
         "timeout_seconds": 0.5,
     }))
     restore_online(orig)
-    assert r["advisory"] is True, r
-    assert r["verdict"] == "deny", r  # 离线 fail-closed
-    assert "超时" in r.get("reason", ""), r
-    print("Guard online timeout fallback (fail-closed): PASSED")
+    assert "error" in r and "超时" in r["error"], r
+    assert "verdict" not in r, r
+    print("Guard online timeout (explicit error, no fallback): PASSED")
 
 
 def test_guard_threshold_clamp():
@@ -174,7 +186,7 @@ def test_jev_multi_question_mock():
 
 
 def test_jev_timeout_circuit_breaker():
-    """jev 主工具超时熔断（mock）：超时必然触发 advisory 降级。"""
+    """jev 主工具超时熔断（mock）：超时直接返回 error，不编造结论。"""
     jmod._adapter_available = True
     jmod._get_agnes_key = lambda: "fake"
     import concurrent.futures
@@ -188,13 +200,13 @@ def test_jev_timeout_circuit_breaker():
         "timeout_seconds": 0.5,
     }))
     restore_online(orig)
-    assert r.get("advisory") is True, r
-    assert "超时" in r.get("reason", ""), r
+    assert "error" in r and "超时" in r["error"], r
+    assert "answers" not in r, r
     print("Timeout circuit breaker: PASSED")
 
 
 def test_jev_error_fallback():
-    """jev 在线异常（mock）：非超时异常也降级 advisory。"""
+    """jev 在线异常（mock）：如实报错，不降级为本地提示。"""
     jmod._adapter_available = True
     jmod._get_agnes_key = lambda: "fake"
     def raise_err():
@@ -206,9 +218,9 @@ def test_jev_error_fallback():
         "no_cache": True,
     }))
     restore_online(orig)
-    assert r.get("advisory") is True, r
-    assert "boom" in r.get("reason", ""), r
-    print("Online error fallback: PASSED")
+    assert "error" in r and "boom" in r["error"], r
+    assert "answers" not in r, r
+    print("Online error reporting (no local fallback): PASSED")
 
 
 def test_disk_persistent_cache():
@@ -248,18 +260,19 @@ def test_journal_log():
     print(f"Journal log: PASSED ({after} total entries)")
 
 
-def test_offline_result_cached():
-    """验证：offline advisory 结果会被缓存（设计如此，1h 内不反复降级）。"""
+def test_no_engine_error_not_cached():
+    """无引擎的 error 结果不写缓存（避免把失败固化，恢复后仍要走真实裁决）。"""
     jmod._adapter_available = False
     jmod._get_agnes_key = lambda: ""
-    args = {"state": "offline-cache-test", "noul": {"name": "oc", "instructions": "测试？"}, "timeout_seconds": 1.0}
+    args = {"state": "no-engine-cache-test", "noul": {"name": "oc", "instructions": "测试？"}, "timeout_seconds": 1.0}
     key = jmod._get_cache_key(args)
     jmod._DECISION_CACHE.pop(key, None)
     r = json.loads(jmod._handle_jev(args))
-    assert r["advisory"] is True, r
-    assert key in jmod._DECISION_CACHE, "offline advisory should be cached"
-    jmod._DECISION_CACHE.pop(key, None)
-    print("Offline advisory caching (by design): PASSED")
+    assert "error" in r, r
+    assert key not in jmod._DECISION_CACHE, "无引擎的 error 不应被缓存"
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+    print("No-engine error not cached: PASSED")
 
 
 def test_semantic_cache_key_isolation():
@@ -292,184 +305,53 @@ def test_guard_low_threshold_dynamic_deny():
     assert r["verdict"] == "ask", r
     print("Guard low threshold dynamic deny: PASSED")
 
-# ---------- TypeSafe 官方直连（2026-10-18 迭代）Mock 基础设施 ----------
+# ---------- 捕获型 mock：校验发往在线引擎的 state 已脱敏 ----------
 import contextlib
-import os as _os
 
 
 @contextlib.contextmanager
-def typesafe_env(key: "str | None" = "test-typesafe-key", model=None):
-    """临时注入 TYPESAFE_API_KEY / JEV_MODEL，退出时精确还原（避免污染其它用例）。"""
-    touched = ("TYPESAFE_API_KEY", "JEV_API_KEY", "JEV_MODEL")
-    old = {k: _os.environ.get(k) for k in touched}
-    if key is None:
-        _os.environ.pop("TYPESAFE_API_KEY", None)
-        _os.environ.pop("JEV_API_KEY", None)
-    else:
-        _os.environ["TYPESAFE_API_KEY"] = key
-        _os.environ.pop("JEV_API_KEY", None)
-    if model:
-        _os.environ["JEV_MODEL"] = model
-    else:
-        _os.environ.pop("JEV_MODEL", None)
-    try:
-        yield
-    finally:
-        for k, v in old.items():
-            if v is None:
-                _os.environ.pop(k, None)
-            else:
-                _os.environ[k] = v
-
-
-@contextlib.contextmanager
-def patch_http(fn):
-    """替换底层 HTTP POST（离线跑直连路径，不触网、不烧 token）。"""
-    orig = jmod._http_post_json
-    jmod._http_post_json = fn
-    try:
-        yield
-    finally:
-        jmod._http_post_json = orig
-
-
-def typesafe_payload(answers):
-    return {"model": "jev-1.14.0", "answers": answers, "usage": {"input_tokens": 321, "output_tokens": 12}}
-
-
-def ts_answers(choice=None, nouls=None, scores=None):
-    """按官方响应形状构造 answers"""
-    out = {}
-    if choice:
-        out[choice[0]] = {"type": "choice", "choice": choice[1], "probabilities": {choice[1]: 0.9}, "confidence": 0.9}
-    for k, v in (nouls or {}).items():
-        out[k] = {"type": "noul", "noul": v}
-    for k, v in (scores or {}).items():
-        out[k] = {"type": "score", "score": v, "legend": {}, "confidence": 0.8}
-    return out
-
-
-def test_typesafe_direct_payload_and_parse():
-    """官方直连：payload 结构正确（model/state/questions），响应解析为统一 answers 形状。"""
+def capture_online(resp):
+    """替换在线执行函数并记录传入参数（离线跑，不触网、不烧 token）。"""
     captured = {}
 
-    def fake_post(url, payload, headers, timeout):
-        captured["url"] = url
-        captured["payload"] = payload
-        captured["headers"] = headers
-        return typesafe_payload(ts_answers(
-            choice=("route", "coder"),
-            nouls={"q1": 1.0, "q2": 0.0, "q3": 0.5},
-            scores={"complexity": 2.0},
-        ))
+    def fake(client, state, questions, provider, timeout):
+        captured["state"] = state
+        captured["questions"] = questions
+        return resp
 
-    with typesafe_env(model="jev-1.14.0"), patch_http(fake_post):
-        r = json.loads(jmod._handle_jev({
-            "state": "多题直连测试",
-            "nouls": [{"name": "q1", "instructions": "是否安全？"}, {"name": "q2", "instructions": "是否可逆？"}],
-            "noul": {"name": "q3", "instructions": "是否需要确认？"},
-            "choice": {"name": "route", "instructions": "优先调用谁？", "criteria": {"coder": "写代码", "searcher": "查资料"}},
-            "score": {"name": "complexity", "instructions": "复杂度？", "criteria": ["低", "中", "高"]},
-            "no_cache": True,
-        }))
-
-    assert captured["url"] == jmod._TYPESAFE_URL, captured["url"]
-    assert captured["payload"]["model"] == "jev-1.14.0", captured["payload"]["model"]
-    assert captured["payload"]["state"] == "多题直连测试"
-    qs = captured["payload"]["questions"]
-    assert qs["route"]["type"] == "choice" and qs["route"]["criteria"] == {"coder": "写代码", "searcher": "查资料"}, qs
-    assert qs["q1"]["type"] == "noul" and "instructions" in qs["q1"], qs
-    assert qs["complexity"]["type"] == "score" and qs["complexity"]["criteria"] == ["低", "中", "高"], qs
-    assert captured["headers"]["Authorization"].startswith("Bearer "), captured["headers"]
-    assert r["engine"] == "typesafe" and r["model"] == "jev-1.14.0", r
-    assert r["answers"]["route"] == "coder" and r["answers"]["q1"] == 1.0 and r["answers"]["complexity"] == 2.0, r
-    assert r["choice_answer"] == "coder" and r["noul_answer"] == 0.5, r
-    assert r["usage"] == {"input_tokens": 321, "output_tokens": 12}, r
-    print("TypeSafe direct: payload shape + answer parsing: PASSED")
+    orig = jmod._execute_system_one_with_timeout
+    jmod._execute_system_one_with_timeout = fake
+    try:
+        yield captured
+    finally:
+        jmod._execute_system_one_with_timeout = orig
 
 
-def test_typesafe_redaction():
-    """凭据脱敏：state 里的 key/token/password 不会原样发给第三方。"""
-    captured = {}
-
-    def fake_post(url, payload, headers, timeout):
-        captured["payload"] = payload
-        return typesafe_payload(ts_answers(nouls={"q": 1.0}))
-
-    secret_state = "curl -H 'Authorization: Bearer sk-abcdef1234567890' && export GITHUB_TOKEN=github_pat_ABCDEFGHIJKLMNOPQRSTUV && password=hunter2secret"
-    with typesafe_env(), patch_http(fake_post):
+def test_redaction_before_online_judgment():
+    """凭据脱敏：state 里的 key/token/password 不会原样发给在线引擎。"""
+    jmod._adapter_available = True
+    jmod._get_agnes_key = lambda: "fake"
+    secret_state = (
+        "curl -H 'Authorization: Bearer sk-abcdefghijklmnop' "
+        "&& export GITHUB_TOKEN=github_pat_abcdefghijklmnopqrst && password=hunter2secret"
+    )
+    with capture_online(make_fake_response(nouls={"q": 1.0})) as captured:
         jmod._handle_jev({"state": secret_state, "noul": {"name": "q", "instructions": "安全？"}, "no_cache": True})
 
-    sent = captured["payload"]["state"]
-    assert "sk-abcdef1234567890" not in sent, sent
-    assert "github_pat_ABCDEFGHIJKLMNOPQRSTUV" not in sent, sent
-    assert "hunter2secret" not in sent, sent
-    assert "[REDACTED]" in sent, sent
+    sent = captured["state"]
+    blob = json.dumps(sent, ensure_ascii=False)
+    assert "sk-abcdefghijklmnop" not in blob, blob
+    assert "github_pat_abcdefghijklmnopqrst" not in blob, blob
+    assert "hunter2secret" not in blob, blob
+    assert "[REDACTED]" in blob, blob
+
     # 结构型 state：按键名脱敏（api_key / token / secret / password …）
     structured = jmod._redact({"cmd": "run", "api_key": "abcdef1234567890", "nested": {"authorization": "xyz"}})
-    assert "abcdef1234567890" not in json.dumps(structured, ensure_ascii=False), json.dumps(structured, ensure_ascii=False)
-    assert "xyz" not in json.dumps(structured, ensure_ascii=False), json.dumps(structured, ensure_ascii=False)
-    assert "run" in json.dumps(structured, ensure_ascii=False), "非敏感字段必须保留"
+    dumped = json.dumps(structured, ensure_ascii=False)
+    assert "abcdef1234567890" not in dumped, dumped
+    assert "xyz" not in dumped, dumped
+    assert "run" in dumped, "非敏感字段必须保留"
     print("Secret redaction before online judgment: PASSED")
-
-
-def test_typesafe_engine_priority():
-    """引擎选择：有 TypeSafe key 时走直连，不再调用 adapter 的 client.system_one。"""
-    calls = {"adapter": 0}
-
-    class BoomClient:
-        def system_one(self, **kwargs):
-            calls["adapter"] += 1
-            raise AssertionError("不应该走 adapter 分支")
-
-    def fake_post(url, payload, headers, timeout):
-        return typesafe_payload(ts_answers(nouls={"q": 1.0}))
-
-    jmod._adapter_available = True
-    jmod._get_agnes_key = lambda: "fake-agnes"
-    with typesafe_env(), patch_http(fake_post):
-        assert jmod._active_engine().startswith("typesafe:"), jmod._active_engine()
-        fb = jmod._executor.submit(jmod._execute_system_one_with_timeout, BoomClient(), "s", {"q": jmod.Noul(instructions="x")}, None, 5.0)
-        resp = fb.result(timeout=10)
-    assert calls["adapter"] == 0, calls
-    assert resp.nouls["q"].noul == 1.0, resp
-    print("Engine priority (typesafe > agnes): PASSED")
-
-
-def test_typesafe_http_error_fallback():
-    """直连 401 / 网络错误：降级 advisory，不抛异常、不阻塞主流程。"""
-    def fake_post(url, payload, headers, timeout):
-        raise RuntimeError("TypeSafe HTTP 401: {\"detail\":\"invalid token\"}")
-
-    with typesafe_env(), patch_http(fake_post):
-        r = json.loads(jmod._handle_jev({
-            "state": "401 降级测试", "noul": {"name": "q", "instructions": "是否？"}, "no_cache": True,
-        }))
-    assert r["advisory"] is True, r
-    assert "401" in r["reason"], r
-    print("TypeSafe HTTP error -> advisory fallback: PASSED")
-
-
-def test_typesafe_429_retry_once():
-    """429 限流：按官方建议退避重试一次即成功。"""
-    calls = {"n": 0}
-
-    def fake_post(url, payload, headers, timeout):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("TypeSafe HTTP 429: rate limited")
-        return typesafe_payload(ts_answers(choice=("route", "searcher")))
-
-    with typesafe_env(), patch_http(fake_post):
-        r = json.loads(jmod._handle_jev({
-            "state": "429 重试测试",
-            "choice": {"name": "route", "instructions": "选一个", "criteria": {"searcher": "查资料", "coder": "写代码"}},
-            "no_cache": True,
-            "timeout_seconds": 20.0,
-        }))
-    assert calls["n"] == 2, calls
-    assert r["answers"]["route"] == "searcher", r
-    print("TypeSafe 429 backoff retry (1x): PASSED")
 
 
 def test_guard_multi_signal_verdict():
@@ -504,23 +386,6 @@ def test_guard_multi_signal_verdict():
     print("Guard multi-signal deterministic verdict: PASSED")
 
 
-def test_engine_isolated_cache_key():
-    """缓存键含引擎标识：换引擎/换模型后不复用旧引擎结论。"""
-    args = {"state": "引擎隔离", "noul": {"name": "q", "instructions": "测试"}}
-    with typesafe_env(key=None):
-        if _os.environ.get("AGNES_API_KEY"):
-            k_online = jmod._get_cache_key(args)
-        else:
-            k_online = jmod._get_cache_key(args)
-    with typesafe_env(model="jev-latest"):
-        k_ts = jmod._get_cache_key(args)
-    with typesafe_env(model="jev-1.14.0"):
-        k_ts2 = jmod._get_cache_key(args)
-    assert k_ts != k_ts2, "不同 Jev 模型必须产生不同缓存键"
-    assert k_ts != k_online, "typesafe 引擎不得与其它引擎共用缓存键"
-    print("Cache key isolation per engine/model: PASSED")
-
-
 def test_jev_usage_serialization():
     """回归：SDK Usage 对象必须转 dict，否则 json.dumps 崩掉整条结果、在线降 advisory（2026-10-18 实弹发现）。"""
     class FakeUsage:
@@ -553,24 +418,19 @@ def test_jev_usage_serialization():
 
 if __name__ == "__main__":
     test_availability()
-    test_guard_offline_rules()
+    test_no_engine_returns_explicit_error()
     test_guard_online_three_tiers()
-    test_guard_online_timeout_fallback()
+    test_guard_online_timeout_stops_clean()
     test_guard_threshold_clamp()
     test_jev_multi_question_mock()
     test_jev_timeout_circuit_breaker()
     test_jev_error_fallback()
     test_disk_persistent_cache()
     test_journal_log()
-    test_offline_result_cached()
+    test_no_engine_error_not_cached()
     test_semantic_cache_key_isolation()
     test_guard_low_threshold_dynamic_deny()
-    test_typesafe_direct_payload_and_parse()
-    test_typesafe_redaction()
-    test_typesafe_engine_priority()
-    test_typesafe_http_error_fallback()
-    test_typesafe_429_retry_once()
+    test_redaction_before_online_judgment()
     test_guard_multi_signal_verdict()
-    test_engine_isolated_cache_key()
     test_jev_usage_serialization()
     print("ALL TESTS PASSED")

@@ -3,11 +3,10 @@
 在 Hermes 注册 `jev` 工具集，允许模型在毫秒级做出"单选 (Choice)"、"打分 (Score)"、"是非率 (Noul)"决策。
 支持单题/多题并发打满（1 次网络往返裁决多个问题），具备双层持久化磁盘缓存、8 秒硬超时熔断与黑匣子审计日志。
 
-引擎链（自动选择，结果里带 `engine` 字段）：
-1. `typesafe` —— TypeSafe 官方直连 `POST https://api.typesafe.ai/v1/systemone`（2026-09-21 起免排队开放，
-   Jev 1.14 于 2026-10-14 发布）。需要 `TYPESAFE_API_KEY`（或 `JEV_API_KEY`），模型由 `JEV_MODEL` 选择。
-2. `agnes` —— `system_one_adapter` 代理到 Agnes 3.0 Flash（免排队平替，需要 `AGNES_API_KEY`）。
-3. `offline` —— 无凭证时降级本地 advisory 规则（guard 保持 fail-closed）。
+引擎（`system_one_adapter` → Agnes 3.0 Flash，结果里带 `engine` 字段）：
+唯一在线引擎是 Agnes 3.0 Flash（需要 `AGNES_API_KEY`）；官方 TypeSafe 直连按量计费，本插件不接入。
+
+引擎不可用、超时或报错时**直接返回 error**：不做本地离线兜底判定，不产生任何"看起来正常"的假结论。
 
 零常驻显存，零后台进程，极低内存消耗。
 """
@@ -22,8 +21,6 @@ import re
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,18 +39,6 @@ try:
 except Exception:
     _adapter_available = False
 
-    # 无 adapter 时的占位题对象：TypeSafe 直连只依赖题面，不需要 adapter。
-    # 类名故意与 adapter 同类名的小写形式一致，供 `_question_to_payload` 识别类型。
-    class choice:  # noqa: N801
-        def __init__(self, instructions: str = "", criteria: Any = None) -> None:
-            self.instructions, self.criteria = instructions, criteria
-
-    class noul(choice):  # noqa: N801
-        pass
-
-    class score(choice):  # noqa: N801
-        pass
-
     class _MissingOpenAIProvider:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError("system_one_adapter 未安装：请 pip install 'system-one-adapter[openai]'")
@@ -64,12 +49,8 @@ _BASE_URL = "https://apihub.agnes-ai.com/v1"
 _MODEL_NAME = "agnes-3.0-flash"
 _DEFAULT_TIMEOUT_SECONDS = 8.0
 
-# TypeSafe 官方直连（GA：2026-09-21 起免排队；Jev 1.14 于 2026-10-14 发布）
-_TYPESAFE_URL = os.environ.get("JEV_URL") or "https://api.typesafe.ai/v1/systemone"
-_JEV_MODEL_DEFAULT = "jev-latest"  # jev-latest → 1.13.0 / jev-preview → 1.14.0 / 也可直接写 jev-1.14.0
-_ENGINE_TYPESAFE = "typesafe"
-_ENGINE_AGNES = "agnes"
-_ENGINE_OFFLINE = "offline"
+_ENGINE_AGNES = "agnes"   # 唯一引擎：system_one_adapter → Agnes 3.0 Flash
+_ENGINE_NONE = "none"     # 无可用引擎：直接报错，不做离线兜底
 
 
 # 1. 缓存路径与黑匣子日志路径
@@ -199,42 +180,6 @@ def _log_journal(entry: Dict[str, Any]) -> None:
         pass
 
 
-def _local_guard_verdict(args: Dict[str, Any]) -> Dict[str, Any]:
-    """离线降级动作闸门（advisory 档）：无 key / adapter 缺失 / 超时熔断时用本地危险模式做保守判定。
-
-    默认拒绝高危动词/命令（fail closed），普通文本放行。
-    结果带 advisory=True，调用方必须把 advisory 判定的放行当建议而非许可。
-    """
-    state = args.get("state") or ""
-    if isinstance(state, dict):
-        state = json.dumps(state, ensure_ascii=False)
-    low = str(state).lower()
-
-    _HARD_DENY = (
-        "rm -rf", "del /f /q", "format ", "diskpart", "shutdown", "reboot",
-        "drop database", "drop table", "truncate table", "mkfs",
-        "rd /s", "shutdown /s",
-    )
-    _ASK = (
-        "delete", "remove", "overwrite", "replace", "reset", "reinstall",
-        "uninstall", "drop", "truncate", "restart", "kill", "push",
-        "git reset", "git checkout --", "清空", "删除", "覆盖", "格式化", "重置",
-    )
-    hard_hit = next((p for p in _HARD_DENY if p in low), None)
-    soft_hit = next((p for p in _ASK if p in low), None)
-
-    if hard_hit:
-        verdict = {"verdict": "deny", "reason": f"命中高危破坏性模式: {hard_hit!r}（本地离线判定，advisory）"}
-    elif soft_hit:
-        verdict = {"verdict": "ask", "reason": f"命中破坏性关键词: {soft_hit!r}（本地离线判定，advisory，建议人工确认）"}
-    else:
-        verdict = {"verdict": "allow", "reason": "未命中破坏性模式（本地离线判定，advisory，未做在线裁决）"}
-    verdict["advisory"] = True
-    verdict["latency_seconds"] = 0.0
-    verdict["cache_hit"] = False
-    return verdict
-
-
 def _get_agnes_key() -> str:
     """提取用户的 AGNES_API_KEY"""
     key = os.environ.get("AGNES_API_KEY")
@@ -255,49 +200,11 @@ def _get_agnes_key() -> str:
     return ""
 
 
-def _get_typesafe_key() -> str:
-    """提取 TypeSafe 官方 API key（TYPESAFE_API_KEY / JEV_API_KEY，或桌面 apikey.txt 的 TypeSafe/Jev 条目）"""
-    key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
-    if key:
-        return key.strip()
-    candidate_paths = [
-        Path.home() / "OneDrive" / "桌面" / "apikey.txt",
-        Path.home() / "Desktop" / "apikey.txt",
-        Path.home() / "桌面" / "apikey.txt",
-    ]
-    for key_file in candidate_paths:
-        if not key_file.exists():
-            continue
-        try:
-            lines = key_file.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            continue
-        for i, line in enumerate(lines):
-            low = line.lower()
-            if ("typesafe" in low or "jev" in low) and i + 1 < len(lines):
-                candidate = lines[i + 1].strip()
-                if candidate and not candidate.startswith("#"):
-                    return candidate
-    return ""
-
-
-def _get_jev_model() -> str:
-    """当前使用的 Jev 模型：JEV_MODEL，默认 jev-latest（官方别名，指向 1.13.0；jev-preview → 1.14.0）"""
-    return (os.environ.get("JEV_MODEL") or _JEV_MODEL_DEFAULT).strip()
-
-
-def _typesafe_available() -> bool:
-    """是否配置了 TypeSafe 官方直连凭据"""
-    return bool(_get_typesafe_key())
-
-
 def _active_engine() -> str:
-    """当前实际会使用的引擎标识（typesafe:<model> > agnes:<model> > offline），同时用于缓存键隔离"""
-    if _typesafe_available():
-        return f"{_ENGINE_TYPESAFE}:{_get_jev_model()}"
+    """当前实际会使用的引擎标识（agnes:<model> / none），同时用于缓存键隔离"""
     if _adapter_available and _get_agnes_key():
         return f"{_ENGINE_AGNES}:{_MODEL_NAME}"
-    return _ENGINE_OFFLINE
+    return _ENGINE_NONE
 
 
 # 发送给第三方裁决前先脱敏（凭据绝不进网络请求，也不进审计日志预览）
@@ -333,46 +240,11 @@ def _redact(value: Any) -> Any:
     return text
 
 
-def _question_to_payload(q: Any) -> Dict[str, Any]:
-    """把 Choice/Noul/Score 对象转成官方 /v1/systemone 的 question 结构"""
-    kind = type(q).__name__.lower()
-    instructions = getattr(q, "instructions", "") or ""
-    criteria = getattr(q, "criteria", None)
-    if kind == "choice":
-        return {"type": "choice", "instructions": instructions, "criteria": criteria or {}}
-    if kind == "score":
-        return {"type": "score", "instructions": instructions, "criteria": criteria or []}
-    return {"type": "noul", "instructions": instructions}
-
-
-def _http_post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
-    """最小 urllib JSON POST（不引入新依赖；自动沿用 HTTP(S)_PROXY 环境变量）"""
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": "hermes-plugin-jev/1.1", **headers},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read()[:400].decode("utf-8", "ignore")
-        except Exception:
-            pass
-        raise RuntimeError(f"TypeSafe HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"TypeSafe 网络错误: {exc.reason}") from exc
-
-
 def _usage_to_dict(usage: Any) -> Dict[str, Any]:
     """把 SDK Usage 对象转成可 JSON 序列化的 dict。
 
     工具结果、磁盘缓存、审计日志都要 `json.dumps`；若直接塞进 SDK 的 Usage 对象，
-    `json.dumps(result)` 会抛 TypeError，把整条在线结果打成 advisory。
+    `json.dumps(result)` 会抛 TypeError，把整条在线结果打成异常。
     """
     if usage is None:
         return {}
@@ -393,59 +265,6 @@ def _usage_to_dict(usage: Any) -> Dict[str, Any]:
         if v is not None:
             out[k] = v
     return out or {"raw": str(usage)}
-
-
-def _call_typesafe_direct(state: Any, questions: Dict[str, Any], timeout: float) -> Any:
-    """调用 TypeSafe 官方 /v1/systemone，并把响应包装成与 system_one_adapter 相同形状的对象。
-
-    这样上层 `_handle_jev` / `_handle_jev_guard` 无需区分引擎，只消费 .choices/.nouls/.scores。
-    """
-    import types as _types
-
-    payload = {
-        "model": _get_jev_model(),
-        "state": _redact(state),
-        "questions": {name: _question_to_payload(q) for name, q in questions.items()},
-    }
-    headers = {"Authorization": f"Bearer {_get_typesafe_key()}"}
-    started = time.time()
-    try:
-        data = _http_post_json(_TYPESAFE_URL, payload, headers, timeout)
-    except RuntimeError as exc:
-        # 429 限流 / 529 过载：按官方建议退避重试一次（仍受外层硬超时约束）
-        if ("429" in str(exc) or "529" in str(exc)) and (time.time() - started) < timeout * 0.6:
-            time.sleep(min(1.0, max(0.2, timeout * 0.1)))
-            remaining = max(0.5, timeout - (time.time() - started))
-            data = _http_post_json(_TYPESAFE_URL, payload, headers, remaining)
-        else:
-            raise
-
-    answers = data.get("answers") or {}
-    response = _types.SimpleNamespace(choices={}, nouls={}, scores={})
-    for name, ans in answers.items():
-        if not isinstance(ans, dict):
-            continue
-        kind = ans.get("type")
-        if kind == "choice" or (kind is None and "choice" in ans):
-            response.choices[name] = _types.SimpleNamespace(
-                choice=ans.get("choice"),
-                probabilities=ans.get("probabilities") or {},
-                confidence=ans.get("confidence"),
-            )
-        elif kind == "score" or (kind is None and "score" in ans):
-            response.scores[name] = _types.SimpleNamespace(
-                score=ans.get("score"),
-                legend=ans.get("legend") or {},
-                probabilities=ans.get("probabilities") or {},
-                confidence=ans.get("confidence"),
-            )
-        elif kind == "noul" or (kind is None and "noul" in ans):
-            response.nouls[name] = _types.SimpleNamespace(noul=ans.get("noul"))
-
-    response.engine = _ENGINE_TYPESAFE
-    response.model = data.get("model") or payload["model"]
-    response.usage = data.get("usage") or {}
-    return response
 
 
 def _guard_verdict_from_signals(signals: Dict[str, Any], threshold: float) -> Optional[tuple]:
@@ -472,9 +291,7 @@ def _guard_verdict_from_signals(signals: Dict[str, Any], threshold: float) -> Op
 
 
 def _jev_tool_available() -> bool:
-    """判断 Jev 小脑是否可用：TypeSafe 直连 key，或 (adapter 已装 + Agnes key)"""
-    if _typesafe_available():
-        return True
+    """判断 Jev 小脑是否可用：adapter 已装 + Agnes key 可获取"""
     return bool(_adapter_available and _get_agnes_key())
 
 
@@ -482,7 +299,7 @@ def _jev_tool_available() -> bool:
 JEV_SCHEMA = {
     "name": "jev",
     "description": (
-        "Jev 决策小脑（TypeSafe 官方直连，缺失时自动回退 Agnes 3.0 Flash 结构化裁决）："
+        "Jev 决策小脑（system_one_adapter → Agnes 3.0 Flash 结构化裁决）："
         "用于在多个可用工具/执行路径之间确有选择不确定性时，先把候选项及其用途传入 Choice 进行按需路由；"
         "主 Agent 再负责调用所选工具并处理结果。"
         "普通对话、工具选择显而易见时不要调用 Jev；不要每轮调用，也不要对每次工具调用重复裁决。"
@@ -570,7 +387,7 @@ JEV_SCHEMA = {
             },
             "timeout_seconds": {
                 "type": "number",
-                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时自动降级为 advisory 模式。",
+                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时直接返回 error，不做本地兜底。",
             },
             "no_cache": {
                 "type": "boolean",
@@ -589,14 +406,14 @@ JEV_GUARD_SCHEMA = {
         "这是第二意见，不会替代系统或用户授权规则。普通低风险工具调用无需逐次运行 guard。"
         "在线时一次请求并行裁决 6 个信号（是否安全 / 策略是否允许 / 是否读取凭据 / 是否外发内容 / "
         "是否自我游说 / 破坏半径），再由确定性代码给出 allow/ask/deny，避免把自由文本当授权。"
-        "在线裁决失败时回退本地规则并标记 advisory；advisory=allow 只是提示，不能作为放行凭据。"
+        "引擎不可用、超时或调用失败时直接返回 error，不给 verdict（没有本地兜底判定）；拿不到 verdict 就不要当作放行凭据。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "state": {
                 "type": ["object", "string"],
-                "description": "只提供与待评估动作直接相关的上下文；移除密钥、令牌、密码和无关个人信息。advisory 结果仅为参考。",
+                "description": "只提供与待评估动作直接相关的上下文；移除密钥、令牌、密码和无关个人信息。引擎不可用或调用失败时会直接返回 error。",
             },
             "guard": {
                 "type": "object",
@@ -614,7 +431,7 @@ JEV_GUARD_SCHEMA = {
             },
             "timeout_seconds": {
                 "type": "number",
-                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时自动降级为本地离线 fail-closed 规则。",
+                "description": "网络裁决超时熔断阈值（秒，默认 8.0 秒）。超时直接返回 error，不做本地兜底。",
             },
             "no_cache": {
                 "type": "boolean",
@@ -644,19 +461,12 @@ def _execute_system_one_with_timeout(
     provider: Any,
     timeout: float,
 ) -> Any:
-    """带硬超时保护的 System One 执行包装器（引擎自动选择）。
-
-    - 有 TypeSafe key → 直连官方 /v1/systemone（结果包成 adapter 同形状）
-    - 否则 → system_one_adapter 代理到 Agnes 3.0 Flash
+    """带硬超时保护的 System One 执行包装器（system_one_adapter → Agnes 3.0 Flash）。
 
     使用模块级单例线程池：超时时 fut.result(timeout) 抛出 TimeoutError，
     主调用方立即返回（真硬超时），后台 worker 继续执行至自然结束，
     绝不阻塞主流程。
     """
-    if _typesafe_available():
-        fut = _executor.submit(_call_typesafe_direct, state, questions, timeout)
-        return fut.result(timeout=timeout)
-
     fut = _executor.submit(
         client.system_one,
         state=state,
@@ -671,6 +481,7 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
     state = args.get("state")
     if state is None:
         return json.dumps({"error": "缺少 state（系统当前状态）参数。"}, ensure_ascii=False)
+    state = _redact(state)  # 发送前脱敏：凭据绝不进第三方请求（也不进审计日志预览）
 
     raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
     try:
@@ -687,22 +498,21 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
             _log_journal({"tool": "jev", "cache_hit": True, "latency_seconds": 0.0, "state_preview": str(_redact(state))[:100]})
             return json.dumps(hit, ensure_ascii=False, indent=2)
 
-    # 离线降级：无任何凭证 → 返回 advisory 提示而非报错
+    # 无可用引擎：直接报错（不做离线兜底，避免把假结论当裁决）
     if not _jev_tool_available():
-        result = {
-            "advisory": True,
-            "engine": _ENGINE_OFFLINE,
-            "reason": (
-                "Jev 在线裁决不可用（缺少 TYPESAFE_API_KEY；也没有 AGNES_API_KEY + system_one_adapter），"
-                "本次判定结果仅为提示性。"
-            ),
-            "cache_hit": False,
-            "latency_seconds": 0.0,
-        }
-        if use_cache:
-            _cache_put(cache_key, result)
-        _log_journal({"tool": "jev", "advisory": True, "reason": "offline", "state_preview": str(_redact(state))[:100]})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        _log_journal({"tool": "jev", "error": "no_engine", "state_preview": str(_redact(state))[:100]})
+        return json.dumps(
+            {
+                "error": "Jev 在线裁决不可用：当前没有可用引擎，本次未做任何判定。",
+                "engine": _ENGINE_NONE,
+                "hint": (
+                    "需要 AGNES_API_KEY（或桌面 apikey.txt 的 AgnesAi 条目）+ 可导入的 system_one_adapter"
+                    "（依赖桥 ~/jev-starter/.venv）。"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     client = SystemOneAdapterClient(
         structured_outputs=False,
@@ -833,36 +643,41 @@ def _handle_jev(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     except concurrent.futures.TimeoutError:
-        # 硬超时熔断：降级为 advisory 模式，主流程绝不卡死
-        fallback = {
-            "advisory": True,
-            "reason": f"Jev 在线裁决超时 (>{timeout:.1f}s)，已触发硬超时熔断，降级为本地 advisory 提示。",
-            "cache_hit": False,
-            "latency_seconds": timeout,
-        }
+        # 硬超时熔断：直接报错（不编造结论），主流程绝不卡死
         _log_journal({"tool": "jev", "timeout": True, "state_preview": str(_redact(state))[:100]})
-        return json.dumps(fallback, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "error": f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何判定。",
+                "engine": _active_engine(),
+                "latency_seconds": timeout,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     except Exception as e:
-        # 在线调用异常：降级 advisory 而非直接报错
-        fallback = {
-            "advisory": True,
-            "reason": f"在线裁决失败，已降级为本地提示: {type(e).__name__}: {e}",
-            "cache_hit": False,
-            "latency_seconds": 0.0,
-        }
+        # 在线调用异常：如实报错（不降级为本地提示）
         _log_journal({"tool": "jev", "error": str(e), "state_preview": str(_redact(state))[:100]})
-        return json.dumps(fallback, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "error": f"在线裁决失败：{type(e).__name__}: {e}",
+                "engine": _active_engine(),
+                "latency_seconds": 0.0,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
-    """处理 guard 动作闸门调用：在线走 Jev 三档裁决，超时或离线降级本地规则（fail-closed advisory）。"""
+    """处理 guard 动作闸门调用：在线走 Jev 六信号裁决；引擎不可用/超时/失败时如实返回 error（不做本地兜底）。"""
     state = args.get("state")
     if state is None:
         return json.dumps(
             {"error": "缺少 state（待执行动作描述）参数。"},
             ensure_ascii=False,
         )
+    state = _redact(state)  # 发送前脱敏：凭据绝不进第三方请求（也不进审计日志预览）
 
     raw_timeout = args.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
     try:
@@ -878,13 +693,18 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
             _log_journal({"tool": "jev_guard", "cache_hit": True, "latency_seconds": 0.0, "state_preview": str(_redact(state))[:100]})
             return json.dumps(hit, ensure_ascii=False, indent=2)
 
-    # 离线降级：无 key / adapter 缺失 → 本地 fail-closed 规则
+    # 无可用引擎：直接报错（不做本地兜底判定，避免给出假 verdict）
     if not _jev_tool_available():
-        verdict = _local_guard_verdict(args)
-        if use_cache:
-            _cache_put(cache_key, verdict)
-        _log_journal({"tool": "jev_guard", "advisory": True, "verdict": verdict["verdict"], "reason": "offline", "state_preview": str(_redact(state))[:100]})
-        return json.dumps(verdict, ensure_ascii=False, indent=2)
+        _log_journal({"tool": "jev_guard", "error": "no_engine", "state_preview": str(_redact(state))[:100]})
+        return json.dumps(
+            {
+                "error": "Jev 闸门不可用：当前没有可用引擎，本次未做任何裁决（无本地兜底）。",
+                "engine": _ENGINE_NONE,
+                "hint": "需要 AGNES_API_KEY + 可导入的 system_one_adapter；拿不到 verdict 就不要当成 allow。",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     guard_cfg = args.get("guard") or {}
     question = Noul(
@@ -978,18 +798,30 @@ def _handle_jev_guard(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     except concurrent.futures.TimeoutError:
-        # 硬超时熔断：降级本地规则，保持 fail-closed
-        fallback = _local_guard_verdict(args)
-        fallback["reason"] = f"在线裁决超时 (>{timeout:.1f}s)，已熔断降级本地规则（advisory，保持 fail-closed）"
-        _log_journal({"tool": "jev_guard", "timeout": True, "verdict": fallback["verdict"], "state_preview": str(_redact(state))[:100]})
-        return json.dumps(fallback, ensure_ascii=False, indent=2)
+        # 硬超时熔断：直接报错，不给 verdict
+        _log_journal({"tool": "jev_guard", "timeout": True, "state_preview": str(_redact(state))[:100]})
+        return json.dumps(
+            {
+                "error": f"在线裁决超时 (>{timeout:.1f}s)，已熔断：本次未做任何裁决（无本地兜底）。",
+                "engine": _active_engine(),
+                "latency_seconds": timeout,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     except Exception as e:
-        # 在线调用失败 → 降级 advisory 而非直接报错，闸门保持 fail closed
-        fallback = _local_guard_verdict(args)
-        fallback["error"] = f"在线裁决失败，已降级本地 advisory 规则: {type(e).__name__}: {e}"
-        _log_journal({"tool": "jev_guard", "error": str(e), "verdict": fallback["verdict"], "state_preview": str(_redact(state))[:100]})
-        return json.dumps(fallback, ensure_ascii=False, indent=2)
+        # 在线调用失败：如实报错，不给 verdict
+        _log_journal({"tool": "jev_guard", "error": str(e), "state_preview": str(_redact(state))[:100]})
+        return json.dumps(
+            {
+                "error": f"在线裁决失败：{type(e).__name__}: {e}",
+                "engine": _active_engine(),
+                "latency_seconds": 0.0,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def register(ctx) -> None:
@@ -1007,6 +839,6 @@ def register(ctx) -> None:
         toolset="jev",
         schema=JEV_GUARD_SCHEMA,
         handler=_handle_jev_guard,
-        check_fn=None,  # 永远可用：在线走 Jev，离线走本地 advisory 规则
+        check_fn=None,  # 始终注册：可用时走在线六信号裁决，不可用时明确返回 error
         emoji="🛡️",
     )

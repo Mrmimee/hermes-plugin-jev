@@ -1,6 +1,6 @@
 ---
 name: jev
-description: "Jev/TypeSafe AI 决策小脑接入 Hermes：TypeSafe 官方直连（jev-latest / jev-1.14）优先，缺凭证时回退 Agnes 3.0 Flash 的极速结构化决策工具"
-version: 1.1.0
+description: "Jev 决策小脑接入 Hermes：system_one_adapter → Agnes 3.0 Flash 结构化决策（单选/是非/打分 + 六信号动作闸门），引擎不可用时直接报错、不编造结论"
+version: 1.2.0
 enabled: true
 kind: backend
